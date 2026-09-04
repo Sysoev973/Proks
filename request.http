@@ -1,0 +1,11 @@
+### 1. Первый запрос (ожидается MISS)
+GET http://localhost:8080/books/123?a=1&b=2
+X-User-ID: u1
+X-Tenant: t1
+X-Locale: ru
+
+### 2. Второй запрос с другим порядком параметров (ожидается HIT)
+GET http://localhost:8080/books/123?b=2&a=1
+X-User-ID: u1
+X-Tenant: t1
+X-Locale: ru
