@@ -9,7 +9,7 @@ import (
 // It keeps only a small set of recent keys and works as a pre-admission filter
 // before full TinyLFU admission.
 type LRUWindow struct {
-	mu         sync.Mutex
+	mu         sync.RWMutex
 	windowSize int
 	lru        *list.List
 	entries    map[string]*list.Element
@@ -17,7 +17,7 @@ type LRUWindow struct {
 
 func NewLRUWindow(size int) *LRUWindow {
 	if size <= 0 {
-		size = 64
+		size = 32
 	}
 	return &LRUWindow{
 		windowSize: size,
@@ -53,8 +53,8 @@ func (w *LRUWindow) Contains(key string) bool {
 	if key == "" {
 		return false
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.mu.RLock()
+	defer w.mu.RUnlock()
 	_, ok := w.entries[key]
 	return ok
 }
@@ -72,7 +72,7 @@ func (w *LRUWindow) Reset(key string) {
 }
 
 func (w *LRUWindow) Len() int {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.mu.RLock()
+	defer w.mu.RUnlock()
 	return len(w.entries)
 }

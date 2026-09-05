@@ -123,6 +123,9 @@ func (h *Handler) computeMetrics(key string) cache.Metrics {
 	metrics := cache.Metrics{Frequency: 1, Pollution: 0, CandidateFrequency: 1, CurrentSize: 0}
 	if c, ok := h.cache.(*cache.InMemoryCache); ok {
 		metrics.CurrentSize = c.Size()
+		if metrics.CurrentSize < c.Capacity()/2 {
+			return metrics
+		}
 		if adm, ok := c.Admission().(*cache.TinyLFUAdmission); ok {
 			if adm.Filter != nil {
 				freq := adm.Filter.Estimate(key)

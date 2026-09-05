@@ -102,8 +102,8 @@ func NewTinyLFURuntimeCache(capacity int) *InMemoryCache {
 		capacity = 1024
 	}
 	filter := NewTinyLFU()
-	window := NewLRUWindow(256)
-	admission := NewTinyLFUAdmission(filter, window, 2, 0.5)
+	window := NewLRUWindow(32)
+	admission := NewTinyLFUAdmission(filter, window, 2, 0.7)
 	return NewInMemoryCache(capacity, admission)
 }
 
@@ -190,6 +190,10 @@ func (c *InMemoryCache) Size() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.items)
+}
+
+func (c *InMemoryCache) Capacity() int {
+	return c.capacity
 }
 
 func (c *InMemoryCache) removeLocked(key string) {

@@ -1,14 +1,13 @@
 package cache
 
 import (
-	"hash/fnv"
 	"sync"
 )
 
 const (
-	defaultCountMinWidth = 1024
+	defaultCountMinWidth = 512
 	defaultCountMinDepth = 2
-	defaultTinyLFUAging  = 128
+	defaultTinyLFUAging  = 256
 )
 
 // CountMinSketch is a compact frequency estimator used by TinyLFU.
@@ -102,10 +101,18 @@ func (c *CountMinSketch) Reset() {
 }
 
 func (c *CountMinSketch) index(key string, salt int) int {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(key))
-	_, _ = h.Write([]byte{byte(salt), byte(salt >> 8)})
-	return int(h.Sum32() % uint32(c.width))
+	return int(hashString32(key, salt) % uint32(c.width))
+}
+
+func hashString32(key string, salt int) uint32 {
+	h := uint32(2166136261)
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	h ^= uint32(salt)
+	h *= 16777619
+	return h
 }
 
 // TinyLFU is a small admission filter that estimates recency/frequency
@@ -193,7 +200,6 @@ func (a *TinyLFUAdmission) ShouldStore(item Item, metrics Metrics) bool {
 	if a == nil {
 		return true
 	}
-
 	if a.Window != nil && a.Window.Contains(item.Key) {
 		return true
 	}
@@ -206,12 +212,10 @@ func (a *TinyLFUAdmission) ShouldStore(item Item, metrics Metrics) bool {
 		candidateFreq = a.Filter.Estimate(item.Key)
 	}
 	if candidateFreq == 0 {
-		candidateFreq = 1
+		return true
 	}
+
 	if metrics.VictimFrequency > 0 && candidateFreq < metrics.VictimFrequency {
-		return false
-	}
-	if a.MinFrequency > 0 && candidateFreq < a.MinFrequency {
 		return false
 	}
 	if metrics.Pollution > 0 && a.MaxPollutionRatio > 0 && metrics.Pollution > a.MaxPollutionRatio {
@@ -223,5 +227,8 @@ func (a *TinyLFUAdmission) ShouldStore(item Item, metrics Metrics) bool {
 			return false
 		}
 	}
-	return candidateFreq > 0
+	if a.MinFrequency > 0 && candidateFreq < a.MinFrequency {
+		return false
+	}
+	return true
 }
