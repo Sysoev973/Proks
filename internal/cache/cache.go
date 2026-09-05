@@ -42,8 +42,12 @@ type Snapshot struct {
 }
 
 type Metrics struct {
-	Frequency float64
-	Pollution float64
+	Frequency          float64
+	Pollution          float64
+	CandidateFrequency uint32
+	VictimFrequency    uint32
+	CurrentSize        int
+	VictimKey          string
 }
 
 type Cache interface {
@@ -55,6 +59,10 @@ type Cache interface {
 
 type AdmissionPolicy interface {
 	ShouldStore(item Item, metrics Metrics) bool
+}
+
+type frequencyAwareAdmission interface {
+	Frequency(key string) uint32
 }
 
 type alwaysAdmission struct{}
@@ -89,6 +97,16 @@ func NewInMemoryCache(capacity int, admission AdmissionPolicy) *InMemoryCache {
 	}
 }
 
+func NewTinyLFURuntimeCache(capacity int) *InMemoryCache {
+	if capacity <= 0 {
+		capacity = 1024
+	}
+	filter := NewTinyLFU()
+	window := NewLRUWindow(32)
+	admission := NewTinyLFUAdmission(filter, window, 2, 0.7)
+	return NewInMemoryCache(capacity, admission)
+}
+
 func (c *InMemoryCache) Get(_ context.Context, key string) (Item, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -111,12 +129,22 @@ func (c *InMemoryCache) Set(_ context.Context, item Item, metrics Metrics) bool 
 	if item.Key == "" {
 		return false
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if len(c.items) >= c.capacity {
+		if back := c.lru.Back(); back != nil {
+			if victimKey, ok := back.Value.(string); ok && victimKey != item.Key {
+				if fa, ok := c.admission.(frequencyAwareAdmission); ok {
+					metrics.VictimKey = victimKey
+					metrics.VictimFrequency = fa.Frequency(victimKey)
+				}
+			}
+		}
+	}
 	if !c.admission.ShouldStore(item, metrics) {
 		return false
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	if e, ok := c.items[item.Key]; ok {
 		e.item = copyItem(item)
@@ -152,6 +180,20 @@ func (c *InMemoryCache) Snapshot(_ context.Context) Snapshot {
 		}
 	}
 	return Snapshot{Size: len(c.items), Keys: keys}
+}
+
+func (c *InMemoryCache) Admission() AdmissionPolicy {
+	return c.admission
+}
+
+func (c *InMemoryCache) Size() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.items)
+}
+
+func (c *InMemoryCache) Capacity() int {
+	return c.capacity
 }
 
 func (c *InMemoryCache) removeLocked(key string) {
