@@ -5,12 +5,14 @@ import (
 	"sync"
 )
 
+// LRUWindow is a compact hot buffer for newly admitted or frequently touched keys.
+// It keeps only a small set of recent keys and works as a pre-admission filter
+// before full TinyLFU admission.
 type LRUWindow struct {
 	mu         sync.Mutex
 	windowSize int
 	lru        *list.List
 	entries    map[string]*list.Element
-	touches    map[string]int
 }
 
 func NewLRUWindow(size int) *LRUWindow {
@@ -21,7 +23,6 @@ func NewLRUWindow(size int) *LRUWindow {
 		windowSize: size,
 		lru:        list.New(),
 		entries:    make(map[string]*list.Element, size),
-		touches:    make(map[string]int, size),
 	}
 }
 
@@ -32,33 +33,46 @@ func (w *LRUWindow) Touch(key string) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	w.touches[key]++
 	if ele, ok := w.entries[key]; ok {
 		w.lru.MoveToFront(ele)
-	} else {
-		ele = w.lru.PushFront(key)
-		w.entries[key] = ele
+		return true
 	}
-
-	if len(w.entries) > w.windowSize {
+	w.entries[key] = w.lru.PushFront(key)
+	if w.lru.Len() > w.windowSize {
 		back := w.lru.Back()
 		if back != nil {
-			evictKey, _ := back.Value.(string)
+			k, _ := back.Value.(string)
 			w.lru.Remove(back)
-			delete(w.entries, evictKey)
-			delete(w.touches, evictKey)
+			delete(w.entries, k)
 		}
 	}
-	return w.touches[key] >= 2
+	return true
+}
+
+func (w *LRUWindow) Contains(key string) bool {
+	if key == "" {
+		return false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_, ok := w.entries[key]
+	return ok
 }
 
 func (w *LRUWindow) Reset(key string) {
+	if key == "" {
+		return
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
 	if ele, ok := w.entries[key]; ok {
 		w.lru.Remove(ele)
 		delete(w.entries, key)
 	}
-	delete(w.touches, key)
+}
+
+func (w *LRUWindow) Len() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.entries)
 }

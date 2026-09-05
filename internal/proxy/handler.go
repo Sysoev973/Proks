@@ -55,6 +55,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	key := BuildCacheKey(r)
 
 	if item, err := h.cache.Get(ctx, key); err == nil {
+		h.recordAccess(key)
 		w.Header().Set("X-Cache-Status", string(cache.StatusHit))
 		w.Header().Set("X-Cache-Reason", string(cache.ReasonLRU))
 		status := item.StatusCode
@@ -73,12 +74,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	metrics := h.computeMetrics(key)
+	h.recordAccess(key)
 	stored := h.cache.Set(ctx, cache.Item{
 		Key:        key,
 		Value:      respBytes,
 		StatusCode: code,
 		ExpiresAt:  time.Now().Add(h.defaultTTL),
-	}, cache.Metrics{})
+	}, metrics)
 
 	copyHeaders(w.Header(), hdr)
 	if stored {
@@ -101,6 +104,46 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) InvalidateBook(ctx context.Context, key string) {
 	h.cache.Delete(ctx, key)
+}
+
+func (h *Handler) recordAccess(key string) {
+	if c, ok := h.cache.(*cache.InMemoryCache); ok {
+		if adm, ok := c.Admission().(*cache.TinyLFUAdmission); ok {
+			if adm.Filter != nil {
+				adm.Filter.Increment(key)
+			}
+			if adm.Window != nil {
+				adm.Window.Touch(key)
+			}
+		}
+	}
+}
+
+func (h *Handler) computeMetrics(key string) cache.Metrics {
+	metrics := cache.Metrics{Frequency: 1, Pollution: 0, CandidateFrequency: 1, CurrentSize: 0}
+	if c, ok := h.cache.(*cache.InMemoryCache); ok {
+		metrics.CurrentSize = c.Size()
+		if adm, ok := c.Admission().(*cache.TinyLFUAdmission); ok {
+			if adm.Filter != nil {
+				freq := adm.Filter.Estimate(key)
+				if freq == 0 {
+					freq = 1
+				}
+				metrics.Frequency = float64(freq)
+				metrics.CandidateFrequency = freq
+			}
+			if metrics.CurrentSize > 0 {
+				if snap := c.Snapshot(context.Background()); len(snap.Keys) > 0 {
+					victimKey := snap.Keys[len(snap.Keys)-1]
+					victimFreq := adm.Frequency(victimKey)
+					metrics.VictimKey = victimKey
+					metrics.VictimFrequency = victimFreq
+					metrics.Pollution = adm.PollutantScore(key, victimKey)
+				}
+			}
+		}
+	}
+	return metrics
 }
 
 func (h *Handler) maybePrefetch(_ context.Context, current string) {

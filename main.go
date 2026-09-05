@@ -19,7 +19,7 @@ func main() {
 	upstream := getenv("UPSTREAM_URL", "http://localhost:8081")
 	addr := getenv("LISTEN_ADDR", ":8080")
 
-	c := cache.NewInMemoryCache(10_000, nil)
+	c := cache.NewTinyLFURuntimeCache(10_000)
 	pred := predictor.NewMarkov()
 	pf := prefetcher.NewAsyncPrefetcher(4, 1024, 100*time.Millisecond, func(ctx context.Context, key string) error {
 		return nil
