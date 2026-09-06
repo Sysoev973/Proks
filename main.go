@@ -21,15 +21,20 @@ func main() {
 
 	c := cache.NewTinyLFURuntimeCache(10_000)
 	pred := predictor.NewMarkov()
+	tracker := predictor.NewTrendTracker(0.35, 3, 0.6)
 	pf := prefetcher.NewAsyncPrefetcher(4, 1024, 100*time.Millisecond, func(ctx context.Context, key string) error {
 		return nil
 	}, log.Default())
+	pf.SetOutcomeHook(func(key string, success bool) {
+		tracker.ObservePrefetch(key, success)
+	})
 	defer pf.Stop()
 
 	h, err := proxy.NewHandler(c, pred, pf, upstream)
 	if err != nil {
 		log.Fatalf("build handler: %v", err)
 	}
+	h.SetTrend(tracker)
 
 	srv := &http.Server{
 		Addr:              addr,

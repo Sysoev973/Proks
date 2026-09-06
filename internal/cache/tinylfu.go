@@ -183,14 +183,10 @@ func (a *TinyLFUAdmission) PollutantScore(candidateKey, victimKey string) float6
 	if victimKey != "" {
 		victimFreq = a.Filter.Estimate(victimKey)
 	}
-	if candidateFreq == 0 && victimFreq == 0 {
+	if candidateFreq == 0 || victimFreq == 0 {
 		return 0
 	}
-	base := float64(candidateFreq + victimFreq)
-	if base <= 0 {
-		return 0
-	}
-	return 1.0 - (float64(candidateFreq) / base)
+	return 1.0 - (float64(candidateFreq) / (float64(victimFreq) + float64(candidateFreq)))
 }
 
 func (a *TinyLFUAdmission) ShouldStore(item Item, metrics Metrics) bool {
