@@ -2,14 +2,20 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"proks/internal/cache"
+	"proks/internal/events"
 	"proks/internal/predictor"
 	"proks/internal/prefetcher"
 	"proks/internal/proxy"
@@ -22,6 +28,7 @@ func main() {
 	c := cache.NewTinyLFURuntimeCache(10_000)
 	pred := predictor.NewMarkov()
 	tracker := predictor.NewTrendTracker(0.35, 3, 0.6)
+	broker := events.NewInMemoryBroker()
 	pf := prefetcher.NewAsyncPrefetcher(4, 1024, 100*time.Millisecond, func(ctx context.Context, key string) error {
 		return nil
 	}, log.Default())
@@ -35,10 +42,35 @@ func main() {
 		log.Fatalf("build handler: %v", err)
 	}
 	h.SetTrend(tracker)
+	h.SetEventStream(broker)
+	if err := h.StartEventConsumer(context.Background()); err != nil {
+		log.Fatalf("subscribe book updates: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(h.MetricsRegistry(), promhttp.HandlerOpts{}))
+	mux.HandleFunc("/internal/events/book.updated", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var evt events.BookUpdateEvent
+		if err := json.NewDecoder(r.Body).Decode(&evt); err != nil {
+			http.Error(w, "invalid event", http.StatusBadRequest)
+			return
+		}
+		if err := broker.Publish(r.Context(), evt); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"status":"accepted"}`))
+	})
+	mux.Handle("/", h)
 
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           h,
+		Handler:           withStructuredLogging(mux),
 		ReadHeaderTimeout: 2 * time.Second,
 	}
 
@@ -64,4 +96,19 @@ func getenv(key, fallback string) string {
 		return fallback
 	}
 	return v
+}
+
+func withStructuredLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestID := r.Header.Get("X-Request-ID")
+		if requestID == "" {
+			requestID = fmt.Sprintf("%d-%s", time.Now().UnixNano(), strings.TrimSpace(r.RemoteAddr))
+		}
+		ctx := context.WithValue(r.Context(), "request_id", requestID)
+		logger := slog.With("component", "http", "request_id", requestID, "method", r.Method, "path", r.URL.Path)
+		w.Header().Set("X-Request-ID", requestID)
+		logger.Info("request_started")
+		next.ServeHTTP(w, r.WithContext(ctx))
+		logger.Info("request_finished")
+	})
 }

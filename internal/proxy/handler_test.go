@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"proks/internal/cache"
+	"proks/internal/events"
 	"proks/internal/predictor"
 	"proks/internal/prefetcher"
 )
@@ -208,5 +210,56 @@ func TestServeHTTPTTLExpiry(t *testing.T) {
 	}
 	if strings.TrimSpace(rr.Body.String()) != "fresh" {
 		t.Fatalf("unexpected body: %s", rr.Body.String())
+	}
+}
+
+func TestBookUpdatedEndpointInvalidatesByVersion(t *testing.T) {
+	c := cache.NewInMemoryCache(32, nil)
+	key := "u|t|ru|book_view:42|"
+	_ = c.Set(context.Background(), cache.Item{Key: key, Value: []byte("old"), StatusCode: http.StatusOK, ExpiresAt: time.Now().Add(time.Minute), Version: 12}, cache.Metrics{})
+
+	pf := prefetcher.NewAsyncPrefetcher(1, 8, 20*time.Millisecond, func(ctx context.Context, key string) error { return nil }, nil)
+	defer pf.Stop()
+
+	h, err := NewHandler(c, predictor.NewMarkov(), pf, "http://example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := events.NewInMemoryBroker()
+	h.SetEventStream(broker)
+	if err := h.StartEventConsumer(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/internal/events/book.updated", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var evt events.BookUpdateEvent
+		if err := json.NewDecoder(r.Body).Decode(&evt); err != nil {
+			http.Error(w, "invalid event", http.StatusBadRequest)
+			return
+		}
+		if err := broker.Publish(r.Context(), evt); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	mux.Handle("/", h)
+
+	req := httptest.NewRequest(http.MethodPost, "/internal/events/book.updated", strings.NewReader(`{"book_id":"42","version":13,"type":"book.updated"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	time.Sleep(25 * time.Millisecond)
+	if _, err := c.Get(context.Background(), key); err == nil {
+		t.Fatal("expected stale book cache entry to be invalidated after versioned event")
 	}
 }

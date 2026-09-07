@@ -33,7 +33,7 @@ type Item struct {
 	Value      []byte
 	StatusCode int
 	ExpiresAt  time.Time
-	Version    string
+	Version    int64
 }
 
 type Snapshot struct {

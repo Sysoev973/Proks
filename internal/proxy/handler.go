@@ -7,11 +7,15 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"proks/internal/cache"
+	"proks/internal/events"
+	"proks/internal/observability"
 	"proks/internal/predictor"
 	"proks/internal/prefetcher"
 )
@@ -27,6 +31,8 @@ type Handler struct {
 	defaultTTL        time.Duration
 	prefetchedMu      sync.Mutex
 	prefetched        map[string]time.Time
+	eventStream       events.Stream
+	metrics           *observability.Metrics
 }
 
 func NewHandler(cache cache.Cache, pred predictor.Predictor, pf prefetcher.Prefetcher, upstream string) (*Handler, error) {
@@ -43,6 +49,7 @@ func NewHandler(cache cache.Cache, pred predictor.Predictor, pf prefetcher.Prefe
 		prefetchThreshold: 0.7,
 		defaultTTL:        5 * time.Minute,
 		prefetched:        make(map[string]time.Time),
+		metrics:           observability.NewMetrics(),
 		httpClient: &http.Client{
 			Timeout: 2 * time.Second,
 			Transport: &http.Transport{
@@ -57,8 +64,17 @@ func NewHandler(cache cache.Cache, pred predictor.Predictor, pf prefetcher.Prefe
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	ctx := r.Context()
 	key := BuildCacheKey(r)
+	status := string(cache.StatusMiss)
+	reason := string(cache.ReasonLRU)
+
+	defer func() {
+		if h.metrics != nil {
+			h.metrics.RecordRequest(status, reason, time.Since(start))
+		}
+	}()
 
 	if item, err := h.cache.Get(ctx, key); err == nil {
 		h.recordAccess(key)
@@ -67,13 +83,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if h.consumePrefetchSignal(key) {
 			h.recordTrend(key, true)
 		}
-		w.Header().Set("X-Cache-Status", string(cache.StatusHit))
-		w.Header().Set("X-Cache-Reason", string(cache.ReasonLRU))
-		status := item.StatusCode
-		if status == 0 {
-			status = http.StatusOK
+		status = string(cache.StatusHit)
+		reason = string(cache.ReasonLRU)
+		w.Header().Set("X-Cache-Status", status)
+		w.Header().Set("X-Cache-Reason", reason)
+		statusCode := item.StatusCode
+		if statusCode == 0 {
+			statusCode = http.StatusOK
 		}
-		w.WriteHeader(status)
+		w.WriteHeader(statusCode)
 		_, _ = w.Write(item.Value)
 		h.maybePrefetchForRequest(ctx, r, current)
 		return
@@ -81,6 +99,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	respBytes, code, hdr, err := h.fetchUpstream(ctx, r)
 	if err != nil {
+		if h.metrics != nil {
+			h.metrics.RecordUpstreamError()
+		}
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
 		return
 	}
@@ -92,15 +113,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Value:      respBytes,
 		StatusCode: code,
 		ExpiresAt:  time.Now().Add(h.defaultTTL),
+		Version:    h.versionFromRequest(r),
 	}, metrics)
+	if h.metrics != nil {
+		h.metrics.RecordPollution(metrics.Pollution)
+	}
 
 	copyHeaders(w.Header(), hdr)
 	if stored {
-		w.Header().Set("X-Cache-Status", string(cache.StatusMiss))
-		w.Header().Set("X-Cache-Reason", string(cache.ReasonLRU))
+		status = string(cache.StatusMiss)
+		reason = string(cache.ReasonLRU)
+		w.Header().Set("X-Cache-Status", status)
+		w.Header().Set("X-Cache-Reason", reason)
 	} else {
-		w.Header().Set("X-Cache-Status", string(cache.StatusBypass))
-		w.Header().Set("X-Cache-Reason", string(cache.ReasonStale))
+		status = string(cache.StatusBypass)
+		reason = string(cache.ReasonStale)
+		w.Header().Set("X-Cache-Status", status)
+		w.Header().Set("X-Cache-Reason", reason)
 	}
 
 	w.WriteHeader(code)
@@ -112,7 +141,83 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) InvalidateBook(ctx context.Context, key string) {
-	h.cache.Delete(ctx, key)
+	if key == "" || h.cache == nil {
+		return
+	}
+	for _, candidate := range h.cache.Snapshot(ctx).Keys {
+		if candidate == key || strings.Contains(candidate, "book_view:"+key) || strings.Contains(candidate, "book:"+key) || strings.Contains(candidate, "book_id="+key) || strings.Contains(candidate, key+"|") {
+			h.cache.Delete(ctx, candidate)
+		}
+	}
+}
+
+func requestIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return "unknown"
+	}
+	if v, ok := ctx.Value("request_id").(string); ok && v != "" {
+		return v
+	}
+	return "unknown"
+}
+
+func (h *Handler) MetricsRegistry() *prometheus.Registry {
+	if h == nil || h.metrics == nil {
+		return prometheus.NewRegistry()
+	}
+	return h.metrics.Registry()
+}
+
+func (h *Handler) versionFromRequest(r *http.Request) int64 {
+	if r == nil {
+		return 0
+	}
+	if v := r.Header.Get("X-Book-Version"); v != "" {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return parsed
+		}
+	}
+	if q := r.URL.Query(); q.Get("version") != "" {
+		v, err := strconv.ParseInt(q.Get("version"), 10, 64)
+		if err == nil {
+			return v
+		}
+	}
+	return 0
+}
+
+func (h *Handler) SetEventStream(stream events.Stream) {
+	h.eventStream = stream
+}
+
+func (h *Handler) StartEventConsumer(ctx context.Context) error {
+	if h.eventStream == nil {
+		return nil
+	}
+	_, err := h.eventStream.Subscribe(ctx, h.HandleBookUpdated)
+	return err
+}
+
+func (h *Handler) HandleBookUpdated(ctx context.Context, event events.BookUpdateEvent) error {
+	if event.BookID == "" || h.cache == nil {
+		return nil
+	}
+	for _, key := range h.cache.Snapshot(ctx).Keys {
+		if !strings.Contains(key, "book_view:"+event.BookID) && !strings.Contains(key, "book:"+event.BookID) && !strings.Contains(key, "book_id="+event.BookID) && !strings.Contains(key, "book/"+event.BookID) {
+			continue
+		}
+		if item, err := h.cache.Get(ctx, key); err == nil {
+			if item.Version == 0 || item.Version <= event.Version {
+				h.cache.Delete(ctx, key)
+			}
+			continue
+		}
+		h.cache.Delete(ctx, key)
+	}
+	if h.metrics != nil {
+		h.metrics.RecordRequest("MISS", "INVALIDATED", 0)
+	}
+	return nil
 }
 
 func (h *Handler) recordAccess(key string) {
@@ -290,6 +395,9 @@ func (h *Handler) maybePrefetchForRequest(ctx context.Context, r *http.Request, 
 	prefetchCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	h.prefetcher.Enqueue(prefetchCtx, prefetchKey, prefetcher.ReasonMarkov)
+	if h.metrics != nil {
+		h.metrics.RecordPrefetch(true, false, false)
+	}
 	h.markPrefetch(prefetchKey)
 	if ctx != nil && ctx.Err() != nil {
 		return
