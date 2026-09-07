@@ -30,15 +30,17 @@ type Stats struct {
 }
 
 type AsyncPrefetcher struct {
-	sf      callGroup
-	fetch   FetchFunc
-	jobs    chan job
-	wg      sync.WaitGroup
-	timeout time.Duration
-	mu      sync.RWMutex
-	closed  bool
-	logger  *log.Logger
-	stats   prefetchStats
+	sf          callGroup
+	fetch       FetchFunc
+	jobs        chan job
+	wg          sync.WaitGroup
+	timeout     time.Duration
+	mu          sync.RWMutex
+	closed      bool
+	logger      *log.Logger
+	stats       prefetchStats
+	queued      map[string]struct{}
+	outcomeHook func(key string, success bool)
 }
 
 type prefetchStats struct {
@@ -113,6 +115,7 @@ func NewAsyncPrefetcher(workers, queueSize int, timeout time.Duration, fetch Fet
 		jobs:    make(chan job, queueSize),
 		timeout: timeout,
 		logger:  logger,
+		queued:  make(map[string]struct{}, queueSize),
 	}
 	for i := 0; i < workers; i++ {
 		p.wg.Add(1)
@@ -133,13 +136,27 @@ func (p *AsyncPrefetcher) Enqueue(ctx context.Context, key string, reason Prefet
 		p.logf("prefetch dropped: service closed key=%s reason=%s", key, reason)
 		return
 	}
+	p.mu.Lock()
+	if _, exists := p.queued[key]; exists {
+		p.mu.Unlock()
+		return
+	}
+	p.queued[key] = struct{}{}
+	p.mu.Unlock()
+
 	select {
 	case p.jobs <- job{key: key, reason: reason}:
 		atomic.AddUint64(&p.stats.enqueued, 1)
 	case <-ctx.Done():
+		p.mu.Lock()
+		delete(p.queued, key)
+		p.mu.Unlock()
 		atomic.AddUint64(&p.stats.dropped, 1)
 		p.logf("prefetch dropped: context done key=%s reason=%s err=%v", key, reason, ctx.Err())
 	default:
+		p.mu.Lock()
+		delete(p.queued, key)
+		p.mu.Unlock()
 		atomic.AddUint64(&p.stats.dropped, 1)
 		p.logf("prefetch dropped: queue full key=%s reason=%s", key, reason)
 	}
@@ -154,7 +171,18 @@ func (p *AsyncPrefetcher) Stop() {
 	p.closed = true
 	close(p.jobs)
 	p.mu.Unlock()
-	p.wg.Wait()
+
+	done := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		p.logf("prefetcher stop timed out; leaving worker goroutines to unwind")
+	}
 }
 
 func (p *AsyncPrefetcher) Snapshot() Stats {
@@ -167,9 +195,18 @@ func (p *AsyncPrefetcher) Snapshot() Stats {
 	}
 }
 
+func (p *AsyncPrefetcher) SetOutcomeHook(hook func(key string, success bool)) {
+	p.mu.Lock()
+	p.outcomeHook = hook
+	p.mu.Unlock()
+}
+
 func (p *AsyncPrefetcher) worker() {
 	defer p.wg.Done()
 	for j := range p.jobs {
+		p.mu.Lock()
+		delete(p.queued, j.key)
+		p.mu.Unlock()
 		if p.fetch == nil {
 			continue
 		}
@@ -180,14 +217,29 @@ func (p *AsyncPrefetcher) worker() {
 		})
 		if err == nil {
 			atomic.AddUint64(&p.stats.executed, 1)
+			p.mu.RLock()
+			if p.outcomeHook != nil {
+				p.outcomeHook(j.key, true)
+			}
+			p.mu.RUnlock()
 			continue
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			atomic.AddUint64(&p.stats.canceled, 1)
+			p.mu.RLock()
+			if p.outcomeHook != nil {
+				p.outcomeHook(j.key, false)
+			}
+			p.mu.RUnlock()
 			p.logf("prefetch canceled key=%s reason=%s err=%v", j.key, j.reason, err)
 			continue
 		}
 		atomic.AddUint64(&p.stats.failed, 1)
+		p.mu.RLock()
+		if p.outcomeHook != nil {
+			p.outcomeHook(j.key, false)
+		}
+		p.mu.RUnlock()
 		p.logf("prefetch failed key=%s reason=%s err=%v", j.key, j.reason, err)
 	}
 }

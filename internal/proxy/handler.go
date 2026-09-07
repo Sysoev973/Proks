@@ -3,11 +3,13 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"proks/internal/cache"
@@ -19,10 +21,13 @@ type Handler struct {
 	cache             cache.Cache
 	predictor         predictor.Predictor
 	prefetcher        prefetcher.Prefetcher
+	trend             *predictor.TrendTracker
 	upstream          *url.URL
 	httpClient        *http.Client
 	prefetchThreshold float64
 	defaultTTL        time.Duration
+	prefetchedMu      sync.Mutex
+	prefetched        map[string]time.Time
 }
 
 func NewHandler(cache cache.Cache, pred predictor.Predictor, pf prefetcher.Prefetcher, upstream string) (*Handler, error) {
@@ -34,9 +39,11 @@ func NewHandler(cache cache.Cache, pred predictor.Predictor, pf prefetcher.Prefe
 		cache:             cache,
 		predictor:         pred,
 		prefetcher:        pf,
+		trend:             predictor.NewTrendTracker(0.35, 3, 0.6),
 		upstream:          u,
 		prefetchThreshold: 0.7,
 		defaultTTL:        5 * time.Minute,
+		prefetched:        make(map[string]time.Time),
 		httpClient: &http.Client{
 			Timeout: 2 * time.Second,
 			Transport: &http.Transport{
@@ -51,11 +58,26 @@ func NewHandler(cache cache.Cache, pred predictor.Predictor, pf prefetcher.Prefe
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/metrics" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+
+		_, _ = fmt.Fprintf(w, "# HELP cache_size Current cache entries\n")
+		_, _ = fmt.Fprintf(w, "cache_size %d\n", h.cache.Size())
+		_, _ = fmt.Fprintf(w, "# HELP cache_capacity Max cache capacity\n")
+		_, _ = fmt.Fprintf(w, "cache_capacity %d\n", h.cache.Capacity())
+		return
+	}
 	ctx := r.Context()
 	key := BuildCacheKey(r)
 
 	if item, err := h.cache.Get(ctx, key); err == nil {
 		h.recordAccess(key)
+		current := normalizeRouteKey(r)
+		h.recordTransition(r, current)
+		if h.consumePrefetchSignal(key) {
+			h.recordTrend(key, true)
+		}
 		w.Header().Set("X-Cache-Status", string(cache.StatusHit))
 		w.Header().Set("X-Cache-Reason", string(cache.ReasonLRU))
 		status := item.StatusCode
@@ -64,7 +86,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(status)
 		_, _ = w.Write(item.Value)
-		h.maybePrefetch(ctx, key)
+		h.maybePrefetchForRequest(ctx, r, current)
 		return
 	}
 
@@ -95,11 +117,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(code)
 	_, _ = w.Write(respBytes)
 
-	prev := r.Header.Get("X-Prev-Route-Key")
-	if prev != "" {
-		h.predictor.Update(prev, normalizeRouteKey(r))
-	}
-	h.maybePrefetch(ctx, key)
+	current := normalizeRouteKey(r)
+	h.recordTransition(r, current)
+	h.maybePrefetchForRequest(ctx, r, current)
 }
 
 func (h *Handler) InvalidateBook(ctx context.Context, key string) {
@@ -117,6 +137,46 @@ func (h *Handler) recordAccess(key string) {
 			}
 		}
 	}
+}
+
+func (h *Handler) SetTrend(tracker *predictor.TrendTracker) {
+	h.trend = tracker
+}
+
+func (h *Handler) recordTrend(key string, success bool) {
+	if h.trend == nil || key == "" {
+		return
+	}
+	h.trend.ObservePrefetch(key, success)
+}
+
+func (h *Handler) markPrefetch(key string) {
+	if key == "" {
+		return
+	}
+	h.prefetchedMu.Lock()
+	defer h.prefetchedMu.Unlock()
+	if h.prefetched == nil {
+		h.prefetched = make(map[string]time.Time)
+	}
+	h.prefetched[key] = time.Now()
+}
+
+func (h *Handler) consumePrefetchSignal(key string) bool {
+	if key == "" {
+		return false
+	}
+	h.prefetchedMu.Lock()
+	defer h.prefetchedMu.Unlock()
+	if h.prefetched == nil {
+		return false
+	}
+	seen, ok := h.prefetched[key]
+	if !ok {
+		return false
+	}
+	delete(h.prefetched, key)
+	return time.Since(seen) <= 5*time.Minute
 }
 
 func (h *Handler) computeMetrics(key string) cache.Metrics {
@@ -150,28 +210,147 @@ func (h *Handler) computeMetrics(key string) cache.Metrics {
 }
 
 func (h *Handler) maybePrefetch(_ context.Context, current string) {
+	h.maybePrefetchForRequest(nil, nil, current)
+}
+
+func (h *Handler) recordTransition(r *http.Request, current string) {
+	if r == nil || current == "" {
+		return
+	}
+	prev := resolvePreviousRoute(r)
+	if prev == "" || prev == current {
+		return
+	}
+	h.predictor.Update(prev, current)
+	if h.trend != nil {
+		h.trend.ObserveTransition(prev, current, true)
+	}
+}
+
+func resolvePreviousRoute(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	for _, key := range []string{"X-Prev-Route-Key", "X-Previous-Route-Key", "X-Previous-Route", "X-Last-Route", "X-Route-Previous"} {
+		if v := r.Header.Get(key); v != "" {
+			return normalizeRouteKeyFromString(v)
+		}
+	}
+	if ref := r.Referer(); ref != "" {
+		if u, err := url.Parse(ref); err == nil && u.Path != "" {
+			return normalizeRouteKeyFromString(u.Path)
+		}
+	}
+	if q := r.URL.Query(); q.Get("prev") != "" {
+		return normalizeRouteKeyFromString(q.Get("prev"))
+	}
+	if v := r.Context().Value("prev_route"); v != nil {
+		if s, ok := v.(string); ok && s != "" {
+			return normalizeRouteKeyFromString(s)
+		}
+	}
+	return ""
+}
+
+func normalizeRouteKeyFromString(s string) string {
+	if s == "" {
+		return ""
+	}
+	if strings.HasPrefix(s, "book_view:") || strings.HasPrefix(s, "category_view:") || strings.HasPrefix(s, "root") {
+		return s
+	}
+	if strings.Contains(s, "http") {
+		if u, err := url.Parse(s); err == nil {
+			s = u.Path
+		}
+	}
+	trimmed := strings.Trim(s, "/")
+	if trimmed == "" {
+		return "root"
+	}
+	return normalizeRouteKey(&http.Request{URL: &url.URL{Path: "/" + trimmed}})
+}
+
+func (h *Handler) maybePrefetchForRequest(ctx context.Context, r *http.Request, current string) {
+	if current == "" {
+		return
+	}
 	cacheCtx := context.Background()
 	candidates := h.predictor.Predict(current)
 	if len(candidates) == 0 {
 		return
 	}
 	top := candidates[0]
-	if top.Probability < h.prefetchThreshold {
+	adjustedProbability := top.Probability
+	if h.trend != nil {
+		adjustedProbability = h.trend.AdjustProbability(top.Key, top.Probability)
+	}
+	if adjustedProbability < h.prefetchThreshold {
 		return
 	}
-	if _, err := h.cache.Get(cacheCtx, top.Key); err == nil {
+	prefetchKey := top.Key
+	if r != nil {
+		prefetchKey = buildScopedCacheKey(r, top.Key)
+	}
+	if _, err := h.cache.Get(cacheCtx, prefetchKey); err == nil {
+		return
+	}
+	if h.cacheIsPolluted(prefetchKey) {
 		return
 	}
 	prefetchCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	h.prefetcher.Enqueue(prefetchCtx, top.Key, prefetcher.ReasonMarkov)
+	h.prefetcher.Enqueue(prefetchCtx, prefetchKey, prefetcher.ReasonMarkov)
+	h.markPrefetch(prefetchKey)
+	if ctx != nil && ctx.Err() != nil {
+		return
+	}
+}
+
+func (h *Handler) cacheIsPolluted(candidateKey string) bool {
+	c, ok := h.cache.(*cache.InMemoryCache)
+	if !ok || c == nil {
+		return false
+	}
+	if c.Size() < c.Capacity()/2 {
+		return false
+	}
+	admission, ok := c.Admission().(*cache.TinyLFUAdmission)
+	if !ok || admission == nil || admission.Filter == nil {
+		return false
+	}
+	if snap := c.Snapshot(context.Background()); len(snap.Keys) > 0 {
+		victimKey := snap.Keys[len(snap.Keys)-1]
+		if victimKey == candidateKey {
+			return true
+		}
+		candidateFreq := admission.Filter.Estimate(candidateKey)
+		victimFreq := admission.Filter.Estimate(victimKey)
+		if candidateFreq == 0 && victimFreq == 0 {
+			return true
+		}
+		if victimFreq > 0 && candidateFreq <= victimFreq && candidateFreq < admission.MinFrequency {
+			return true
+		}
+		pollution := admission.PollutantScore(candidateKey, victimKey)
+		if victimFreq > candidateFreq && pollution > admission.MaxPollutionRatio {
+			return true
+		}
+	}
+	return false
 }
 
 func BuildCacheKey(r *http.Request) string {
+	return buildScopedCacheKey(r, normalizeRouteKey(r))
+}
+
+func buildScopedCacheKey(r *http.Request, route string) string {
+	if r == nil {
+		return route
+	}
 	userID := r.Header.Get("X-User-ID")
 	tenant := r.Header.Get("X-Tenant")
 	locale := r.Header.Get("X-Locale")
-	route := normalizeRouteKey(r)
 	query := normalizeQuery(r.URL.Query())
 	return strings.Join([]string{userID, tenant, locale, route, query}, "|")
 }

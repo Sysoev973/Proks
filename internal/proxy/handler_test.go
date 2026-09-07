@@ -90,9 +90,41 @@ func TestMaybePrefetchThreshold(t *testing.T) {
 	}
 
 	pred.Update("book_view:1", "book_view:2")
+	h.prefetchThreshold = 0.6
 	h.maybePrefetch(context.Background(), "book_view:1")
 	if len(pf.keys) != 1 || pf.keys[0] != "book_view:2" {
 		t.Fatalf("expected prefetch for top candidate book_view:2, got %+v", pf.keys)
+	}
+}
+
+func TestMaybePrefetchSkipsPollutedCache(t *testing.T) {
+	filter := cache.NewTinyLFU()
+	for i := 0; i < 12; i++ {
+		filter.Increment("book_view:3")
+	}
+	window := cache.NewLRUWindow(4)
+	c := cache.NewInMemoryCache(2, cache.NewTinyLFUAdmission(filter, window, 2, 0.5))
+	_ = c.Set(context.Background(), cache.Item{Key: "book_view:9", Value: []byte("a")}, cache.Metrics{})
+	_ = c.Set(context.Background(), cache.Item{Key: "book_view:10", Value: []byte("b")}, cache.Metrics{})
+
+	pf := &recordingPrefetcher{}
+	pred := predictor.NewMarkov()
+	pred.Update("book_view:1", "book_view:2")
+	pred.Update("book_view:1", "book_view:2")
+	pred.Update("book_view:1", "book_view:2")
+
+	h, err := NewHandler(c, pred, pf, "http://example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.trend = nil
+	h.prefetchThreshold = 0.5
+	if _, ok := c.Admission().(*cache.TinyLFUAdmission); !ok {
+		t.Fatal("expected TinyLFU admission to be active")
+	}
+	h.maybePrefetch(context.Background(), "book_view:1")
+	if len(pf.keys) != 0 {
+		t.Fatalf("expected polluted cache to suppress prefetch, got %+v", pf.keys)
 	}
 }
 
@@ -176,5 +208,24 @@ func TestServeHTTPTTLExpiry(t *testing.T) {
 	}
 	if strings.TrimSpace(rr.Body.String()) != "fresh" {
 		t.Fatalf("unexpected body: %s", rr.Body.String())
+	}
+}
+func TestServeHTTPMetrics(t *testing.T) {
+	c := cache.NewInMemoryCache(10, nil)
+	h, err := NewHandler(c, predictor.NewMarkov(), noopPrefetcher{}, "http://example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "cache_size") {
+		t.Fatalf("expected metrics output, got: %s", rr.Body.String())
 	}
 }
