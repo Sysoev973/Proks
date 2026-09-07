@@ -62,11 +62,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 
-		// Пример выгрузки основных показателей:
-		fmt.Fprintf(w, "# HELP cache_size Current cache entries\n")
-		fmt.Fprintf(w, "cache_size %d\n", h.cache.Size())
-		fmt.Fprintf(w, "# HELP cache_capacity Max cache capacity\n")
-		fmt.Fprintf(w, "cache_capacity %d\n", h.cache.Capacity())
+		_, _ = fmt.Fprintf(w, "# HELP cache_size Current cache entries\n")
+		_, _ = fmt.Fprintf(w, "cache_size %d\n", h.cache.Size())
+		_, _ = fmt.Fprintf(w, "# HELP cache_capacity Max cache capacity\n")
+		_, _ = fmt.Fprintf(w, "cache_capacity %d\n", h.cache.Capacity())
 		return
 	}
 	ctx := r.Context()
