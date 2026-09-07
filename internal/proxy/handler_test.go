@@ -210,3 +210,22 @@ func TestServeHTTPTTLExpiry(t *testing.T) {
 		t.Fatalf("unexpected body: %s", rr.Body.String())
 	}
 }
+func TestServeHTTPMetrics(t *testing.T) {
+	c := cache.NewInMemoryCache(10, nil)
+	h, err := NewHandler(c, predictor.NewMarkov(), noopPrefetcher{}, "http://example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "cache_size") {
+		t.Fatalf("expected metrics output, got: %s", rr.Body.String())
+	}
+}

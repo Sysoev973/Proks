@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -57,6 +58,17 @@ func NewHandler(cache cache.Cache, pred predictor.Predictor, pf prefetcher.Prefe
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/metrics" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+
+		// Пример выгрузки основных показателей:
+		fmt.Fprintf(w, "# HELP cache_size Current cache entries\n")
+		fmt.Fprintf(w, "cache_size %d\n", h.cache.Size())
+		fmt.Fprintf(w, "# HELP cache_capacity Max cache capacity\n")
+		fmt.Fprintf(w, "cache_capacity %d\n", h.cache.Capacity())
+		return
+	}
 	ctx := r.Context()
 	key := BuildCacheKey(r)
 

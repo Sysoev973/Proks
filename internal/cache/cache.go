@@ -55,6 +55,8 @@ type Cache interface {
 	Set(ctx context.Context, item Item, metrics Metrics) bool
 	Delete(ctx context.Context, key string)
 	Snapshot(ctx context.Context) Snapshot
+	Size() int
+	Capacity() int
 }
 
 type AdmissionPolicy interface {
