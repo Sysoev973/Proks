@@ -23,6 +23,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+const maxRequestBodySize = 10 * 1024 * 1024
+
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
+
 type Handler struct {
 	cache             cache.Cache
 	predictor         predictor.Predictor
@@ -36,6 +44,8 @@ type Handler struct {
 	prefetched        map[string]time.Time
 	eventStream       events.Stream
 	metrics           *observability.Metrics
+	indexMu           sync.RWMutex
+	bookKeys          map[string]map[string]struct{} // bookID - множество cache keys
 }
 
 func NewHandler(cache cache.Cache, pred predictor.Predictor, pf prefetcher.Prefetcher, upstream string) (*Handler, error) {
@@ -53,6 +63,7 @@ func NewHandler(cache cache.Cache, pred predictor.Predictor, pf prefetcher.Prefe
 		defaultTTL:        5 * time.Minute,
 		prefetched:        make(map[string]time.Time),
 		metrics:           observability.NewMetrics(),
+		bookKeys:          make(map[string]map[string]struct{}),
 		httpClient: &http.Client{
 			Timeout: 2 * time.Second,
 			Transport: &http.Transport{
@@ -133,6 +144,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:  time.Now().Add(h.defaultTTL),
 		Version:    h.versionFromRequest(r),
 	}, metrics)
+	if stored {
+		if bookID := extractBookIDFromRoute(key); bookID != "" {
+			h.registerBookKey(bookID, key)
+		}
+	}
 	if h.metrics != nil {
 		h.metrics.RecordPollution(metrics.Pollution)
 	}
@@ -220,18 +236,39 @@ func (h *Handler) HandleBookUpdated(ctx context.Context, event events.BookUpdate
 	if event.BookID == "" || h.cache == nil {
 		return nil
 	}
-	for _, key := range h.cache.Snapshot(ctx).Keys {
-		if !strings.Contains(key, "book_view:"+event.BookID) && !strings.Contains(key, "book:"+event.BookID) && !strings.Contains(key, "book_id="+event.BookID) && !strings.Contains(key, "book/"+event.BookID) {
-			continue
+
+	h.indexMu.Lock()
+	keysToDeleteMap, exists := h.bookKeys[event.BookID]
+	if exists {
+		delete(h.bookKeys, event.BookID)
+	}
+	h.indexMu.Unlock()
+
+	var keysToDelete []string
+
+	if exists && len(keysToDeleteMap) > 0 {
+		for k := range keysToDeleteMap {
+			keysToDelete = append(keysToDelete, k)
 		}
+	} else {
+		snap := h.cache.Snapshot(ctx)
+		for _, key := range snap.Keys {
+			if extractedID := extractBookIDFromRoute(key); extractedID == event.BookID || strings.Contains(key, event.BookID) {
+				keysToDelete = append(keysToDelete, key)
+			}
+		}
+	}
+
+	for _, key := range keysToDelete {
 		if item, err := h.cache.Get(ctx, key); err == nil {
-			if item.Version == 0 || item.Version <= event.Version {
+			if event.Version == 0 || item.Version == 0 || item.Version <= event.Version {
 				h.cache.Delete(ctx, key)
 			}
-			continue
+		} else {
+			h.cache.Delete(ctx, key)
 		}
-		h.cache.Delete(ctx, key)
 	}
+
 	if h.metrics != nil {
 		h.metrics.RecordRequest("MISS", "INVALIDATED", 0)
 	}
@@ -504,14 +541,26 @@ func normalizeQuery(v url.Values) string {
 }
 
 func (h *Handler) fetchUpstream(ctx context.Context, in *http.Request) ([]byte, int, http.Header, error) {
-	bodyCopy, err := io.ReadAll(in.Body)
-	if err != nil {
-		return nil, 0, nil, err
+	if in.Body != nil && in.Body != http.NoBody {
+		buf := bufferPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		defer bufferPool.Put(buf)
+
+		limitedReader := io.LimitReader(in.Body, maxRequestBodySize)
+		if _, err := buf.ReadFrom(limitedReader); err != nil {
+			return nil, 0, nil, err
+		}
+		_ = in.Body.Close()
+
+		bodyBytes := buf.Bytes()
+		bodyCopy := make([]byte, len(bodyBytes))
+		copy(bodyCopy, bodyBytes)
+
+		in.Body = io.NopCloser(bytes.NewReader(bodyCopy))
 	}
-	in.Body = io.NopCloser(bytes.NewReader(bodyCopy))
 
 	upstreamURL := h.upstream.ResolveReference(&url.URL{Path: in.URL.Path, RawQuery: in.URL.RawQuery}).String()
-	outReq, err := http.NewRequestWithContext(ctx, in.Method, upstreamURL, bytes.NewReader(bodyCopy))
+	outReq, err := http.NewRequestWithContext(ctx, in.Method, upstreamURL, in.Body)
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -523,11 +572,19 @@ func (h *Handler) fetchUpstream(ctx context.Context, in *http.Request) ([]byte, 
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
+	bufResp := bufferPool.Get().(*bytes.Buffer)
+	bufResp.Reset()
+	defer bufferPool.Put(bufResp)
+
+	limitedRespReader := io.LimitReader(resp.Body, maxRequestBodySize)
+	if _, err := bufResp.ReadFrom(limitedRespReader); err != nil {
 		return nil, 0, nil, err
 	}
-	return body, resp.StatusCode, resp.Header.Clone(), nil
+
+	respBodyCopy := make([]byte, bufResp.Len())
+	copy(respBodyCopy, bufResp.Bytes())
+
+	return respBodyCopy, resp.StatusCode, resp.Header.Clone(), nil
 }
 
 func copyHeaders(dst, src http.Header) {
@@ -541,4 +598,35 @@ func copyHeaders(dst, src http.Header) {
 
 func (h *Handler) Metrics() *observability.Metrics {
 	return h.metrics
+}
+
+func (h *Handler) registerBookKey(bookID, key string) {
+	if bookID == "" || key == "" {
+		return
+	}
+	h.indexMu.Lock()
+	defer h.indexMu.Unlock()
+
+	if h.bookKeys[bookID] == nil {
+		h.bookKeys[bookID] = make(map[string]struct{})
+	}
+	h.bookKeys[bookID][key] = struct{}{}
+}
+
+func extractBookIDFromRoute(s string) string {
+	if idx := strings.Index(s, "book_view:"); idx != -1 {
+		rest := s[idx+len("book_view:"):]
+		if end := strings.IndexAny(rest, "|/"); end != -1 {
+			return rest[:end]
+		}
+		return rest
+	}
+	if idx := strings.Index(s, "/books/"); idx != -1 {
+		rest := s[idx+len("/books/"):]
+		if end := strings.IndexAny(rest, "|/?"); end != -1 {
+			return rest[:end]
+		}
+		return rest
+	}
+	return ""
 }
