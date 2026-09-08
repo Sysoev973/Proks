@@ -9,16 +9,18 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"proks/internal/observability"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"proks/internal/cache"
 	"proks/internal/events"
 	"proks/internal/predictor"
 	"proks/internal/prefetcher"
 	"proks/internal/proxy"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -28,7 +30,14 @@ func main() {
 	c := cache.NewTinyLFURuntimeCache(10_000)
 	pred := predictor.NewMarkov()
 	tracker := predictor.NewTrendTracker(0.35, 3, 0.6)
-	broker := events.NewInMemoryBroker()
+	rabbitmqURL := getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+
+	broker, err := events.NewRabbitBroker(rabbitmqURL)
+	if err != nil {
+		log.Fatalf("failed to connect rabbitmq: %v", err)
+	}
+	defer broker.Close()
+
 	pf := prefetcher.NewAsyncPrefetcher(4, 1024, 100*time.Millisecond, func(ctx context.Context, key string) error {
 		return nil
 	}, log.Default())
@@ -46,6 +55,8 @@ func main() {
 	if err := h.StartEventConsumer(context.Background()); err != nil {
 		log.Fatalf("subscribe book updates: %v", err)
 	}
+
+	go runPrefetchMetricsLoop(context.Background(), pf, h.Metrics(), 2*time.Second)
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(h.MetricsRegistry(), promhttp.HandlerOpts{}))
@@ -111,4 +122,25 @@ func withStructuredLogging(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r.WithContext(ctx))
 		logger.Info("request_finished")
 	})
+}
+func runPrefetchMetricsLoop(ctx context.Context, pf *prefetcher.AsyncPrefetcher, m *observability.Metrics, interval time.Duration) {
+	var last prefetcher.Stats
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			snap := pf.Snapshot()
+			m.RecordQueueDepth(pf.QueueDepth())
+			m.RecordPrefetchDelta(
+				snap.Executed-last.Executed,
+				snap.Dropped-last.Dropped,
+				snap.Canceled-last.Canceled,
+				snap.Failed-last.Failed,
+			)
+			last = snap
+		}
+	}
 }

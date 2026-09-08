@@ -19,7 +19,9 @@ type Metrics struct {
 	queueDepth       prometheus.Gauge
 	prefetchDropped  prometheus.Counter
 	prefetchCanceled prometheus.Counter
-	upstreamErrors   prometheus.Counter
+	upstreamErrors   *prometheus.CounterVec
+	prefetchExecuted prometheus.Counter
+	prefetchFailed   prometheus.Counter
 }
 
 func NewMetrics() *Metrics {
@@ -63,13 +65,36 @@ func NewMetrics() *Metrics {
 			Name: "proxy_prefetch_canceled_total",
 			Help: "Total canceled prefetch jobs.",
 		}),
-		upstreamErrors: prometheus.NewCounter(prometheus.CounterOpts{
+		upstreamErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "proxy_upstream_errors_total",
-			Help: "Total upstream request errors.",
+			Help: "Total upstream request errors, labeled by kind.",
+		}, []string{"kind"}),
+		prefetchExecuted: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "proxy_prefetch_executed_total",
+			Help: "Total prefetch jobs that actually completed and warmed the cache.",
+		}),
+		prefetchFailed: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "proxy_prefetch_failed_total",
+			Help: "Total prefetch jobs that failed (non-timeout error).",
 		}),
 	}
-	reg.MustRegister(m.hits, m.misses, m.bypasses, m.prefetches, m.latency, m.pollution, m.queueDepth, m.prefetchDropped, m.prefetchCanceled, m.upstreamErrors)
+	reg.MustRegister(m.hits, m.misses, m.bypasses, m.prefetches, m.latency, m.pollution, m.queueDepth, m.prefetchDropped, m.prefetchCanceled, m.upstreamErrors, m.prefetchExecuted, m.prefetchFailed)
 	return m
+}
+
+func (m *Metrics) RecordPrefetchDelta(executedDelta, droppedDelta, canceledDelta, failedDelta uint64) {
+	if executedDelta > 0 {
+		m.prefetchExecuted.Add(float64(executedDelta))
+	}
+	if droppedDelta > 0 {
+		m.prefetchDropped.Add(float64(droppedDelta))
+	}
+	if canceledDelta > 0 {
+		m.prefetchCanceled.Add(float64(canceledDelta))
+	}
+	if failedDelta > 0 {
+		m.prefetchFailed.Add(float64(failedDelta))
+	}
 }
 
 func (m *Metrics) Registry() *prometheus.Registry { return m.registry }
@@ -109,6 +134,10 @@ func (m *Metrics) RecordQueueDepth(depth int) {
 	m.queueDepth.Set(float64(depth))
 }
 
-func (m *Metrics) RecordUpstreamError() {
-	m.upstreamErrors.Inc()
+func (m *Metrics) RecordUpstreamError(kind string) {
+	m.upstreamErrors.WithLabelValues(kind).Inc()
+}
+
+func (m *Metrics) RecordPrefetchEnqueued() {
+	m.prefetches.Inc()
 }

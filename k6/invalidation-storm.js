@@ -14,8 +14,12 @@ export default function () {
     return;
   }
   const payload = JSON.stringify({ book_id: '42', version: 1000, type: 'book.updated' });
-  const res = http.post('http://localhost:8080/internal/events/book.updated', payload, {
-    headers: { 'Content-Type': 'application/json' },
+  const res = http.get('http://localhost:8080/books/42', {
+    headers: {
+      'X-User-ID': `user-${__VU}`,
+      'X-Tenant': 'acme',
+      'X-Locale': 'ru',
+    },
   });
   check(res, { 'event accepted': (r) => r.status >= 200 && r.status < 300 });
 }

@@ -12,7 +12,7 @@ func TestMetricsRecordsLifecycle(t *testing.T) {
 	m.RecordPrefetch(true, false, false)
 	m.RecordPollution(0.23)
 	m.RecordQueueDepth(3)
-	m.RecordUpstreamError()
+	m.RecordUpstreamError("timeout")
 
 	metrics, err := m.Registry().Gather()
 	if err != nil {

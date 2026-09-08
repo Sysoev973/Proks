@@ -3,7 +3,9 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
@@ -12,12 +14,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"proks/internal/cache"
 	"proks/internal/events"
 	"proks/internal/observability"
 	"proks/internal/predictor"
 	"proks/internal/prefetcher"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type Handler struct {
@@ -74,6 +77,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if h.metrics != nil {
 			h.metrics.RecordRequest(status, reason, time.Since(start))
 		}
+		slog.Info("cache_decision",
+			"request_id", requestIDFromContext(ctx),
+			"key", key,
+			"status", status,
+			"reason", reason,
+			"duration_ms", time.Since(start).Milliseconds(),
+		)
 	}()
 
 	if item, err := h.cache.Get(ctx, key); err == nil {
@@ -82,9 +92,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.recordTransition(r, current)
 		if h.consumePrefetchSignal(key) {
 			h.recordTrend(key, true)
+			status = string(cache.StatusPrefetch)
+			reason = string(cache.ReasonMarkov)
+		} else {
+			status = string(cache.StatusHit)
+			reason = string(cache.ReasonLRU)
 		}
-		status = string(cache.StatusHit)
-		reason = string(cache.ReasonLRU)
+
 		w.Header().Set("X-Cache-Status", status)
 		w.Header().Set("X-Cache-Reason", reason)
 		statusCode := item.StatusCode
@@ -100,7 +114,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	respBytes, code, hdr, err := h.fetchUpstream(ctx, r)
 	if err != nil {
 		if h.metrics != nil {
-			h.metrics.RecordUpstreamError()
+			kind := "other"
+			if errors.Is(err, context.DeadlineExceeded) {
+				kind = "timeout"
+			}
+			h.metrics.RecordUpstreamError(kind)
 		}
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
 		return
@@ -396,7 +414,7 @@ func (h *Handler) maybePrefetchForRequest(ctx context.Context, r *http.Request, 
 	defer cancel()
 	h.prefetcher.Enqueue(prefetchCtx, prefetchKey, prefetcher.ReasonMarkov)
 	if h.metrics != nil {
-		h.metrics.RecordPrefetch(true, false, false)
+		h.metrics.RecordPrefetchEnqueued()
 	}
 	h.markPrefetch(prefetchKey)
 	if ctx != nil && ctx.Err() != nil {
@@ -519,4 +537,8 @@ func copyHeaders(dst, src http.Header) {
 			dst.Add(k, v)
 		}
 	}
+}
+
+func (h *Handler) Metrics() *observability.Metrics {
+	return h.metrics
 }
