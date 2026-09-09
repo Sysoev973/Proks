@@ -265,7 +265,7 @@ func TestBookUpdatedEndpointInvalidatesByVersion(t *testing.T) {
 }
 
 // Тест перехода между главами
-func TestE2EBookInvalidationViaHTTPEndpoint(t *testing.T) {
+func TestE2EBook(t *testing.T) {
 	// 1. Мок upstream-сервера
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
