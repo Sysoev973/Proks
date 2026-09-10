@@ -13,7 +13,7 @@
 
 3. Upstream client с таймаутами/connection pooling.
 
-4. main.go wiring + graceful shutdown.
+4. wiring + graceful shutdown.
 
 5. Базовые тесты: key normalization, HIT/MISS/BYPASS, TTL expiry.
 >Что и будет являться первым этапом
