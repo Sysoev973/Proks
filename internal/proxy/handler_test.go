@@ -212,7 +212,6 @@ func TestServeHTTPTTLExpiry(t *testing.T) {
 		t.Fatalf("unexpected body: %s", rr.Body.String())
 	}
 }
-
 func TestBookUpdatedEndpointInvalidatesByVersion(t *testing.T) {
 	c := cache.NewInMemoryCache(32, nil)
 	key := "u|t|ru|book_view:42|"
@@ -342,7 +341,6 @@ func TestE2EBook(t *testing.T) {
 		t.Fatalf("Шаг В: ожидали инвалидацию кэша (MISS), но получили HIT")
 	}
 }
-
 func TestServeHTTPMetrics(t *testing.T) {
 	c := cache.NewInMemoryCache(10, nil)
 	h, err := NewHandler(c, predictor.NewMarkov(), noopPrefetcher{}, "http://example.com")

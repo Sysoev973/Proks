@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net/http"
@@ -44,9 +45,42 @@ func main() {
 	}
 	defer broker.Close()
 
+	httpClient := &http.Client{
+		Timeout: 2 * time.Second,
+	}
+
 	pf := prefetcher.NewAsyncPrefetcher(4, 1024, 100*time.Millisecond, func(ctx context.Context, key string) error {
+		reqURL := fmt.Sprintf("%s/%s", upstream, key)
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if err != nil {
+			return err
+		}
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("upstream returned status: %d", resp.StatusCode)
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+
+		c.Set(ctx, cache.Item{
+			Key:        key,
+			Value:      body,
+			StatusCode: resp.StatusCode,
+		}, cache.Metrics{})
+
 		return nil
 	}, log.Default())
+
 	pf.SetOutcomeHook(func(key string, success bool) {
 		tracker.ObservePrefetch(key, success)
 	})

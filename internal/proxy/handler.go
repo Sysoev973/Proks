@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	_ "fmt"
 	"io"
 	"log/slog"
 	"net/http"
