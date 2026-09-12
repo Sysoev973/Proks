@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	_ "fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -79,6 +81,18 @@ func NewHandler(cache cache.Cache, pred predictor.Predictor, pf prefetcher.Prefe
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+
+	if r.URL.Path == "/metrics" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+
+		_, _ = fmt.Fprintf(w, "# HELP cache_size Current cache entries\n")
+		_, _ = fmt.Fprintf(w, "cache_size %d\n", h.cache.Size())
+		_, _ = fmt.Fprintf(w, "# HELP cache_capacity Max cache capacity\n")
+		_, _ = fmt.Fprintf(w, "cache_capacity %d\n", h.cache.Capacity())
+		return
+	}
+
 	ctx := r.Context()
 	key := BuildCacheKey(r)
 	status := string(cache.StatusMiss)

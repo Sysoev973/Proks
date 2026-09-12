@@ -273,7 +273,7 @@ func TestE2EBook(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	//Запуск кэша, прокси и шины событий
+	// Запуск кэша, прокси и шины событий
 	c := cache.NewInMemoryCache(32, nil)
 	h, err := NewHandler(c, predictor.NewMarkov(), noopPrefetcher{}, upstream.URL)
 	if err != nil {
@@ -286,7 +286,7 @@ func TestE2EBook(t *testing.T) {
 		t.Fatalf("failed to start event consumer: %v", err)
 	}
 
-	//Настройка роутера
+	// Настройка роутера
 	mux := http.NewServeMux()
 	mux.Handle("/internal/events/book.updated", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -306,7 +306,7 @@ func TestE2EBook(t *testing.T) {
 	}))
 	mux.Handle("/", h)
 
-	//Заполнение кэша и получение статуса HIT
+	// Заполнение кэша и получение статуса HIT
 	req1 := httptest.NewRequest(http.MethodGet, "/books/123", nil)
 	rec1 := httptest.NewRecorder()
 	mux.ServeHTTP(rec1, req1) // Чтение 1: MISS (наполнение кэша)
@@ -319,7 +319,7 @@ func TestE2EBook(t *testing.T) {
 		t.Fatalf("Шаг А: ожидали X-Cache-Status: HIT, получили: %s", status)
 	}
 
-	//Отправка события обновления книги через HTTP POST
+	// Отправка события обновления книги через HTTP POST
 	body := strings.NewReader(`{"book_id": "123", "version": 1}`)
 	eventReq := httptest.NewRequest(http.MethodPost, "/internal/events/book.updated", body)
 	eventReq.Header.Set("Content-Type", "application/json")
@@ -333,12 +333,32 @@ func TestE2EBook(t *testing.T) {
 	// Пауза для обработки события асинхронным воркером
 	time.Sleep(30 * time.Millisecond)
 
-	//Проверка инвалидации кэша (MISS)
+	// Проверка инвалидации кэша (MISS)
 	req3 := httptest.NewRequest(http.MethodGet, "/books/123", nil)
 	rec3 := httptest.NewRecorder()
-	mux.ServeHTTP(rec3, req3) //MISS
+	mux.ServeHTTP(rec3, req3) // MISS
 
 	if status := rec3.Header().Get("X-Cache-Status"); status == "HIT" {
 		t.Fatalf("Шаг В: ожидали инвалидацию кэша (MISS), но получили HIT")
+	}
+}
+
+func TestServeHTTPMetrics(t *testing.T) {
+	c := cache.NewInMemoryCache(10, nil)
+	h, err := NewHandler(c, predictor.NewMarkov(), noopPrefetcher{}, "http://example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "cache_size") {
+		t.Fatalf("expected metrics output, got: %s", rr.Body.String())
 	}
 }

@@ -9,13 +9,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"proks/internal/observability"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"proks/internal/cache"
 	"proks/internal/events"
+	"proks/internal/observability"
 	"proks/internal/predictor"
 	"proks/internal/prefetcher"
 	"proks/internal/proxy"
@@ -29,9 +30,14 @@ func main() {
 
 	c := cache.NewTinyLFURuntimeCache(10_000)
 	pred := predictor.NewMarkov()
-	tracker := predictor.NewTrendTracker(0.35, 3, 0.6)
-	rabbitmqURL := getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
 
+	alpha := getenvFloat("EWMA_ALPHA", 0.35)
+	minObs := getenvUint64("EWMA_MIN_OBSERVATIONS", 3)
+	cutoff := getenvFloat("EWMA_CUTOFF", 0.6)
+
+	tracker := predictor.NewTrendTracker(alpha, minObs, cutoff)
+
+	rabbitmqURL := getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
 	broker, err := events.NewRabbitBroker(rabbitmqURL)
 	if err != nil {
 		log.Fatalf("failed to connect rabbitmq: %v", err)
@@ -123,6 +129,7 @@ func withStructuredLogging(next http.Handler) http.Handler {
 		logger.Info("request_finished")
 	})
 }
+
 func runPrefetchMetricsLoop(ctx context.Context, pf *prefetcher.AsyncPrefetcher, m *observability.Metrics, interval time.Duration) {
 	var last prefetcher.Stats
 	ticker := time.NewTicker(interval)
@@ -143,4 +150,20 @@ func runPrefetchMetricsLoop(ctx context.Context, pf *prefetcher.AsyncPrefetcher,
 			last = snap
 		}
 	}
+}
+
+func getenvFloat(key string, fallback float64) float64 {
+	v := os.Getenv(key)
+	if f, err := strconv.ParseFloat(v, 64); err == nil {
+		return f
+	}
+	return fallback
+}
+
+func getenvUint64(key string, fallback uint64) uint64 {
+	v := os.Getenv(key)
+	if u, err := strconv.ParseUint(v, 10, 64); err == nil {
+		return u
+	}
+	return fallback
 }
