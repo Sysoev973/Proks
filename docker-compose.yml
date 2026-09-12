@@ -1,0 +1,55 @@
+version: '3.9'
+services:
+  proxy:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      UPSTREAM_URL: http://upstream:8081
+      LISTEN_ADDR: :8080
+    depends_on:
+      - upstream
+      - prometheus
+      - grafana
+      - rabbitmq
+
+  upstream:
+    build:
+      context: .
+      dockerfile: Dockerfile.upstream
+    ports:
+      - "8081:8081"
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus:/etc/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+
+  k6:
+    image: grafana/k6:latest
+    depends_on:
+      - proxy
+    volumes:
+      - ./k6:/scripts
+    entrypoint: ["sh", "-c", "sleep 15; k6 run /scripts/read-heavy.js --vus 10 --duration 30s"]

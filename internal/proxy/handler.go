@@ -3,19 +3,34 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"proks/internal/cache"
+	"proks/internal/events"
+	"proks/internal/observability"
 	"proks/internal/predictor"
 	"proks/internal/prefetcher"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
+
+const maxRequestBodySize = 10 * 1024 * 1024
+
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
 
 type Handler struct {
 	cache             cache.Cache
@@ -28,6 +43,10 @@ type Handler struct {
 	defaultTTL        time.Duration
 	prefetchedMu      sync.Mutex
 	prefetched        map[string]time.Time
+	eventStream       events.Stream
+	metrics           *observability.Metrics
+	indexMu           sync.RWMutex
+	bookKeys          map[string]map[string]struct{} // bookID - множество cache keys
 }
 
 func NewHandler(cache cache.Cache, pred predictor.Predictor, pf prefetcher.Prefetcher, upstream string) (*Handler, error) {
@@ -44,6 +63,8 @@ func NewHandler(cache cache.Cache, pred predictor.Predictor, pf prefetcher.Prefe
 		prefetchThreshold: 0.7,
 		defaultTTL:        5 * time.Minute,
 		prefetched:        make(map[string]time.Time),
+		metrics:           observability.NewMetrics(),
+		bookKeys:          make(map[string]map[string]struct{}),
 		httpClient: &http.Client{
 			Timeout: 2 * time.Second,
 			Transport: &http.Transport{
@@ -58,6 +79,8 @@ func NewHandler(cache cache.Cache, pred predictor.Predictor, pf prefetcher.Prefe
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
 	if r.URL.Path == "/metrics" {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
@@ -68,8 +91,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(w, "cache_capacity %d\n", h.cache.Capacity())
 		return
 	}
+
 	ctx := r.Context()
 	key := BuildCacheKey(r)
+	status := string(cache.StatusMiss)
+	reason := string(cache.ReasonLRU)
+
+	defer func() {
+		if h.metrics != nil {
+			h.metrics.RecordRequest(status, reason, time.Since(start))
+		}
+		slog.Info("cache_decision",
+			"request_id", requestIDFromContext(ctx),
+			"key", key,
+			"status", status,
+			"reason", reason,
+			"duration_ms", time.Since(start).Milliseconds(),
+		)
+	}()
 
 	if item, err := h.cache.Get(ctx, key); err == nil {
 		h.recordAccess(key)
@@ -77,14 +116,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.recordTransition(r, current)
 		if h.consumePrefetchSignal(key) {
 			h.recordTrend(key, true)
+			status = string(cache.StatusPrefetch)
+			reason = string(cache.ReasonMarkov)
+		} else {
+			status = string(cache.StatusHit)
+			reason = string(cache.ReasonLRU)
 		}
-		w.Header().Set("X-Cache-Status", string(cache.StatusHit))
-		w.Header().Set("X-Cache-Reason", string(cache.ReasonLRU))
-		status := item.StatusCode
-		if status == 0 {
-			status = http.StatusOK
+
+		w.Header().Set("X-Cache-Status", status)
+		w.Header().Set("X-Cache-Reason", reason)
+		statusCode := item.StatusCode
+		if statusCode == 0 {
+			statusCode = http.StatusOK
 		}
-		w.WriteHeader(status)
+		w.WriteHeader(statusCode)
 		_, _ = w.Write(item.Value)
 		h.maybePrefetchForRequest(ctx, r, current)
 		return
@@ -92,6 +137,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	respBytes, code, hdr, err := h.fetchUpstream(ctx, r)
 	if err != nil {
+		if h.metrics != nil {
+			kind := "other"
+			if errors.Is(err, context.DeadlineExceeded) {
+				kind = "timeout"
+			}
+			h.metrics.RecordUpstreamError(kind)
+		}
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
 		return
 	}
@@ -103,15 +155,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Value:      respBytes,
 		StatusCode: code,
 		ExpiresAt:  time.Now().Add(h.defaultTTL),
+		Version:    h.versionFromRequest(r),
 	}, metrics)
+	if stored {
+		if bookID := extractBookIDFromRoute(key); bookID != "" {
+			h.registerBookKey(bookID, key)
+		}
+	}
+	if h.metrics != nil {
+		h.metrics.RecordPollution(metrics.Pollution)
+	}
 
 	copyHeaders(w.Header(), hdr)
 	if stored {
-		w.Header().Set("X-Cache-Status", string(cache.StatusMiss))
-		w.Header().Set("X-Cache-Reason", string(cache.ReasonLRU))
+		status = string(cache.StatusMiss)
+		reason = string(cache.ReasonLRU)
+		w.Header().Set("X-Cache-Status", status)
+		w.Header().Set("X-Cache-Reason", reason)
 	} else {
-		w.Header().Set("X-Cache-Status", string(cache.StatusBypass))
-		w.Header().Set("X-Cache-Reason", string(cache.ReasonStale))
+		status = string(cache.StatusBypass)
+		reason = string(cache.ReasonStale)
+		w.Header().Set("X-Cache-Status", status)
+		w.Header().Set("X-Cache-Reason", reason)
 	}
 
 	w.WriteHeader(code)
@@ -123,7 +188,104 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) InvalidateBook(ctx context.Context, key string) {
-	h.cache.Delete(ctx, key)
+	if key == "" || h.cache == nil {
+		return
+	}
+	for _, candidate := range h.cache.Snapshot(ctx).Keys {
+		if candidate == key || strings.Contains(candidate, "book_view:"+key) || strings.Contains(candidate, "book:"+key) || strings.Contains(candidate, "book_id="+key) || strings.Contains(candidate, key+"|") {
+			h.cache.Delete(ctx, candidate)
+		}
+	}
+}
+
+func requestIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return "unknown"
+	}
+	if v, ok := ctx.Value("request_id").(string); ok && v != "" {
+		return v
+	}
+	return "unknown"
+}
+
+func (h *Handler) MetricsRegistry() *prometheus.Registry {
+	if h == nil || h.metrics == nil {
+		return prometheus.NewRegistry()
+	}
+	return h.metrics.Registry()
+}
+
+func (h *Handler) versionFromRequest(r *http.Request) int64 {
+	if r == nil {
+		return 0
+	}
+	if v := r.Header.Get("X-Book-Version"); v != "" {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return parsed
+		}
+	}
+	if q := r.URL.Query(); q.Get("version") != "" {
+		v, err := strconv.ParseInt(q.Get("version"), 10, 64)
+		if err == nil {
+			return v
+		}
+	}
+	return 0
+}
+
+func (h *Handler) SetEventStream(stream events.Stream) {
+	h.eventStream = stream
+}
+
+func (h *Handler) StartEventConsumer(ctx context.Context) error {
+	if h.eventStream == nil {
+		return nil
+	}
+	_, err := h.eventStream.Subscribe(ctx, h.HandleBookUpdated)
+	return err
+}
+
+func (h *Handler) HandleBookUpdated(ctx context.Context, event events.BookUpdateEvent) error {
+	if event.BookID == "" || h.cache == nil {
+		return nil
+	}
+
+	h.indexMu.Lock()
+	keysToDeleteMap, exists := h.bookKeys[event.BookID]
+	if exists {
+		delete(h.bookKeys, event.BookID)
+	}
+	h.indexMu.Unlock()
+
+	var keysToDelete []string
+
+	if exists && len(keysToDeleteMap) > 0 {
+		for k := range keysToDeleteMap {
+			keysToDelete = append(keysToDelete, k)
+		}
+	} else {
+		snap := h.cache.Snapshot(ctx)
+		for _, key := range snap.Keys {
+			if extractedID := extractBookIDFromRoute(key); extractedID == event.BookID || strings.Contains(key, event.BookID) {
+				keysToDelete = append(keysToDelete, key)
+			}
+		}
+	}
+
+	for _, key := range keysToDelete {
+		if item, err := h.cache.Get(ctx, key); err == nil {
+			if event.Version == 0 || item.Version == 0 || item.Version <= event.Version {
+				h.cache.Delete(ctx, key)
+			}
+		} else {
+			h.cache.Delete(ctx, key)
+		}
+	}
+
+	if h.metrics != nil {
+		h.metrics.RecordRequest("MISS", "INVALIDATED", 0)
+	}
+	return nil
 }
 
 func (h *Handler) recordAccess(key string) {
@@ -301,6 +463,9 @@ func (h *Handler) maybePrefetchForRequest(ctx context.Context, r *http.Request, 
 	prefetchCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	h.prefetcher.Enqueue(prefetchCtx, prefetchKey, prefetcher.ReasonMarkov)
+	if h.metrics != nil {
+		h.metrics.RecordPrefetchEnqueued()
+	}
 	h.markPrefetch(prefetchKey)
 	if ctx != nil && ctx.Err() != nil {
 		return
@@ -389,14 +554,26 @@ func normalizeQuery(v url.Values) string {
 }
 
 func (h *Handler) fetchUpstream(ctx context.Context, in *http.Request) ([]byte, int, http.Header, error) {
-	bodyCopy, err := io.ReadAll(in.Body)
-	if err != nil {
-		return nil, 0, nil, err
+	if in.Body != nil && in.Body != http.NoBody {
+		buf := bufferPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		defer bufferPool.Put(buf)
+
+		limitedReader := io.LimitReader(in.Body, maxRequestBodySize)
+		if _, err := buf.ReadFrom(limitedReader); err != nil {
+			return nil, 0, nil, err
+		}
+		_ = in.Body.Close()
+
+		bodyBytes := buf.Bytes()
+		bodyCopy := make([]byte, len(bodyBytes))
+		copy(bodyCopy, bodyBytes)
+
+		in.Body = io.NopCloser(bytes.NewReader(bodyCopy))
 	}
-	in.Body = io.NopCloser(bytes.NewReader(bodyCopy))
 
 	upstreamURL := h.upstream.ResolveReference(&url.URL{Path: in.URL.Path, RawQuery: in.URL.RawQuery}).String()
-	outReq, err := http.NewRequestWithContext(ctx, in.Method, upstreamURL, bytes.NewReader(bodyCopy))
+	outReq, err := http.NewRequestWithContext(ctx, in.Method, upstreamURL, in.Body)
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -408,11 +585,19 @@ func (h *Handler) fetchUpstream(ctx context.Context, in *http.Request) ([]byte, 
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
+	bufResp := bufferPool.Get().(*bytes.Buffer)
+	bufResp.Reset()
+	defer bufferPool.Put(bufResp)
+
+	limitedRespReader := io.LimitReader(resp.Body, maxRequestBodySize)
+	if _, err := bufResp.ReadFrom(limitedRespReader); err != nil {
 		return nil, 0, nil, err
 	}
-	return body, resp.StatusCode, resp.Header.Clone(), nil
+
+	respBodyCopy := make([]byte, bufResp.Len())
+	copy(respBodyCopy, bufResp.Bytes())
+
+	return respBodyCopy, resp.StatusCode, resp.Header.Clone(), nil
 }
 
 func copyHeaders(dst, src http.Header) {
@@ -422,4 +607,39 @@ func copyHeaders(dst, src http.Header) {
 			dst.Add(k, v)
 		}
 	}
+}
+
+func (h *Handler) Metrics() *observability.Metrics {
+	return h.metrics
+}
+
+func (h *Handler) registerBookKey(bookID, key string) {
+	if bookID == "" || key == "" {
+		return
+	}
+	h.indexMu.Lock()
+	defer h.indexMu.Unlock()
+
+	if h.bookKeys[bookID] == nil {
+		h.bookKeys[bookID] = make(map[string]struct{})
+	}
+	h.bookKeys[bookID][key] = struct{}{}
+}
+
+func extractBookIDFromRoute(s string) string {
+	if idx := strings.Index(s, "book_view:"); idx != -1 {
+		rest := s[idx+len("book_view:"):]
+		if end := strings.IndexAny(rest, "|/"); end != -1 {
+			return rest[:end]
+		}
+		return rest
+	}
+	if idx := strings.Index(s, "/books/"); idx != -1 {
+		rest := s[idx+len("/books/"):]
+		if end := strings.IndexAny(rest, "|/?"); end != -1 {
+			return rest[:end]
+		}
+		return rest
+	}
+	return ""
 }

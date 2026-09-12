@@ -195,6 +195,10 @@ func (p *AsyncPrefetcher) Snapshot() Stats {
 	}
 }
 
+func (p *AsyncPrefetcher) QueueDepth() int {
+	return len(p.jobs)
+}
+
 func (p *AsyncPrefetcher) SetOutcomeHook(hook func(key string, success bool)) {
 	p.mu.Lock()
 	p.outcomeHook = hook
