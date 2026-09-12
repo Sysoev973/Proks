@@ -17,14 +17,14 @@
   ## Установка зависимостей проекта:
 
   ```bash
-  go mod download
+  winget install GoLang.Go
   ```
 
   ## Установка k6:
   - **Windows**
 
   ```powershell
-  choco install k6
+  winget install k6
   ```
 
   - **MacOS**
