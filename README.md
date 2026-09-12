@@ -94,8 +94,14 @@ curl.exe -i http://localhost:8080/books/1
 
 ```powershell
 go test -v .\...
-go test -race .\...
+go test -count=1 ./...
 ```
+
+```
+$env:CGO_ENABLED="1"
+go test -race ./...
+```
+Третья команда -race, может выдавать ошибки
 
 - **4.3. Проверка покрытия кода (Code Coverage):**
 
