@@ -1,0 +1,9 @@
+FROM golang:1.22 AS builder
+WORKDIR /src
+COPY . .
+RUN go build -o /out/upstream ./cmd/upstream
+
+FROM gcr.io/distroless/base-debian12
+COPY --from=builder /out/upstream /upstream
+EXPOSE 8081
+ENTRYPOINT ["/upstream"]

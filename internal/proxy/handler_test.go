@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"proks/internal/cache"
+	"proks/internal/events"
 	"proks/internal/predictor"
 	"proks/internal/prefetcher"
 )
@@ -210,6 +212,137 @@ func TestServeHTTPTTLExpiry(t *testing.T) {
 		t.Fatalf("unexpected body: %s", rr.Body.String())
 	}
 }
+
+func TestBookUpdatedEndpointInvalidatesByVersion(t *testing.T) {
+	c := cache.NewInMemoryCache(32, nil)
+	key := "u|t|ru|book_view:42|"
+	_ = c.Set(context.Background(), cache.Item{Key: key, Value: []byte("old"), StatusCode: http.StatusOK, ExpiresAt: time.Now().Add(time.Minute), Version: 12}, cache.Metrics{})
+
+	pf := prefetcher.NewAsyncPrefetcher(1, 8, 20*time.Millisecond, func(ctx context.Context, key string) error { return nil }, nil)
+	defer pf.Stop()
+
+	h, err := NewHandler(c, predictor.NewMarkov(), pf, "http://example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := events.NewInMemoryBroker()
+	h.SetEventStream(broker)
+	if err := h.StartEventConsumer(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/internal/events/book.updated", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var evt events.BookUpdateEvent
+		if err := json.NewDecoder(r.Body).Decode(&evt); err != nil {
+			http.Error(w, "invalid event", http.StatusBadRequest)
+			return
+		}
+		if err := broker.Publish(r.Context(), evt); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	mux.Handle("/", h)
+
+	req := httptest.NewRequest(http.MethodPost, "/internal/events/book.updated", strings.NewReader(`{"book_id":"42","version":13,"type":"book.updated"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	time.Sleep(25 * time.Millisecond)
+	if _, err := c.Get(context.Background(), key); err == nil {
+		t.Fatal("expected stale book cache entry to be invalidated after versioned event")
+	}
+}
+
+// Тест перехода между главами
+func TestE2EBook(t *testing.T) {
+	// 1. Мок upstream-сервера
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"123","title":"Go Internals"}`))
+	}))
+	defer upstream.Close()
+
+	// Запуск кэша, прокси и шины событий
+	c := cache.NewInMemoryCache(32, nil)
+	h, err := NewHandler(c, predictor.NewMarkov(), noopPrefetcher{}, upstream.URL)
+	if err != nil {
+		t.Fatalf("failed to create handler: %v", err)
+	}
+
+	broker := events.NewInMemoryBroker()
+	h.SetEventStream(broker)
+	if err := h.StartEventConsumer(context.Background()); err != nil {
+		t.Fatalf("failed to start event consumer: %v", err)
+	}
+
+	// Настройка роутера
+	mux := http.NewServeMux()
+	mux.Handle("/internal/events/book.updated", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var evt events.BookUpdateEvent
+		if err := json.NewDecoder(r.Body).Decode(&evt); err != nil {
+			http.Error(w, "invalid event", http.StatusBadRequest)
+			return
+		}
+		if err := broker.Publish(r.Context(), evt); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	mux.Handle("/", h)
+
+	// Заполнение кэша и получение статуса HIT
+	req1 := httptest.NewRequest(http.MethodGet, "/books/123", nil)
+	rec1 := httptest.NewRecorder()
+	mux.ServeHTTP(rec1, req1) // Чтение 1: MISS (наполнение кэша)
+
+	req2 := httptest.NewRequest(http.MethodGet, "/books/123", nil)
+	rec2 := httptest.NewRecorder()
+	mux.ServeHTTP(rec2, req2) // Чтение 2: Должен быть HIT
+
+	if status := rec2.Header().Get("X-Cache-Status"); status != "HIT" {
+		t.Fatalf("Шаг А: ожидали X-Cache-Status: HIT, получили: %s", status)
+	}
+
+	// Отправка события обновления книги через HTTP POST
+	body := strings.NewReader(`{"book_id": "123", "version": 1}`)
+	eventReq := httptest.NewRequest(http.MethodPost, "/internal/events/book.updated", body)
+	eventReq.Header.Set("Content-Type", "application/json")
+	eventRec := httptest.NewRecorder()
+	mux.ServeHTTP(eventRec, eventReq)
+
+	if eventRec.Code != http.StatusAccepted {
+		t.Fatalf("Шаг Б: ожидали статус 202 Accepted, получили: %d", eventRec.Code)
+	}
+
+	// Пауза для обработки события асинхронным воркером
+	time.Sleep(30 * time.Millisecond)
+
+	// Проверка инвалидации кэша (MISS)
+	req3 := httptest.NewRequest(http.MethodGet, "/books/123", nil)
+	rec3 := httptest.NewRecorder()
+	mux.ServeHTTP(rec3, req3) // MISS
+
+	if status := rec3.Header().Get("X-Cache-Status"); status == "HIT" {
+		t.Fatalf("Шаг В: ожидали инвалидацию кэша (MISS), но получили HIT")
+	}
+}
+
 func TestServeHTTPMetrics(t *testing.T) {
 	c := cache.NewInMemoryCache(10, nil)
 	h, err := NewHandler(c, predictor.NewMarkov(), noopPrefetcher{}, "http://example.com")

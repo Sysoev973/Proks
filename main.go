@@ -2,21 +2,26 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
-	_ "strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"proks/internal/cache"
+	"proks/internal/events"
+	"proks/internal/observability"
 	"proks/internal/predictor"
 	"proks/internal/prefetcher"
 	"proks/internal/proxy"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -26,52 +31,22 @@ func main() {
 	c := cache.NewTinyLFURuntimeCache(10_000)
 	pred := predictor.NewMarkov()
 
-	// 1. Конфигурация EWMA из ENV с правильными типами (float64, uint64, float64)
 	alpha := getenvFloat("EWMA_ALPHA", 0.35)
 	minObs := getenvUint64("EWMA_MIN_OBSERVATIONS", 3)
 	cutoff := getenvFloat("EWMA_CUTOFF", 0.6)
 
 	tracker := predictor.NewTrendTracker(alpha, minObs, cutoff)
 
-	httpClient := &http.Client{
-		Timeout: 2 * time.Second,
+	rabbitmqURL := getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+	broker, err := events.NewRabbitBroker(rabbitmqURL)
+	if err != nil {
+		log.Fatalf("failed to connect rabbitmq: %v", err)
 	}
-
-	upstreamURL := "http://localhost:8081"
+	defer broker.Close()
 
 	pf := prefetcher.NewAsyncPrefetcher(4, 1024, 100*time.Millisecond, func(ctx context.Context, key string) error {
-		reqURL := fmt.Sprintf("%s/%s", upstreamURL, key)
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-		if err != nil {
-			return err
-		}
-
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("upstream returned status: %d", resp.StatusCode)
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return err
-		}
-
-		// Запись в кэш с точным соблюдением (ctx, cache.Item, cache.Metrics)
-		c.Set(ctx, cache.Item{
-			Key:        key,
-			Value:      body,
-			StatusCode: resp.StatusCode,
-		}, cache.Metrics{})
-
 		return nil
 	}, log.Default())
-
 	pf.SetOutcomeHook(func(key string, success bool) {
 		tracker.ObservePrefetch(key, success)
 	})
@@ -82,10 +57,37 @@ func main() {
 		log.Fatalf("build handler: %v", err)
 	}
 	h.SetTrend(tracker)
+	h.SetEventStream(broker)
+	if err := h.StartEventConsumer(context.Background()); err != nil {
+		log.Fatalf("subscribe book updates: %v", err)
+	}
+
+	go runPrefetchMetricsLoop(context.Background(), pf, h.Metrics(), 2*time.Second)
+
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(h.MetricsRegistry(), promhttp.HandlerOpts{}))
+	mux.HandleFunc("/internal/events/book.updated", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var evt events.BookUpdateEvent
+		if err := json.NewDecoder(r.Body).Decode(&evt); err != nil {
+			http.Error(w, "invalid event", http.StatusBadRequest)
+			return
+		}
+		if err := broker.Publish(r.Context(), evt); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"status":"accepted"}`))
+	})
+	mux.Handle("/", h)
 
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           h,
+		Handler:           withStructuredLogging(mux),
 		ReadHeaderTimeout: 2 * time.Second,
 	}
 
@@ -105,13 +107,49 @@ func main() {
 	_ = srv.Shutdown(ctx)
 }
 
-// 3. Хелперы конвертации вынесены на уровень пакета
 func getenv(key, fallback string) string {
 	v := os.Getenv(key)
 	if v == "" {
 		return fallback
 	}
 	return v
+}
+
+func withStructuredLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestID := r.Header.Get("X-Request-ID")
+		if requestID == "" {
+			requestID = fmt.Sprintf("%d-%s", time.Now().UnixNano(), strings.TrimSpace(r.RemoteAddr))
+		}
+		ctx := context.WithValue(r.Context(), "request_id", requestID)
+		logger := slog.With("component", "http", "request_id", requestID, "method", r.Method, "path", r.URL.Path)
+		w.Header().Set("X-Request-ID", requestID)
+		logger.Info("request_started")
+		next.ServeHTTP(w, r.WithContext(ctx))
+		logger.Info("request_finished")
+	})
+}
+
+func runPrefetchMetricsLoop(ctx context.Context, pf *prefetcher.AsyncPrefetcher, m *observability.Metrics, interval time.Duration) {
+	var last prefetcher.Stats
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			snap := pf.Snapshot()
+			m.RecordQueueDepth(pf.QueueDepth())
+			m.RecordPrefetchDelta(
+				snap.Executed-last.Executed,
+				snap.Dropped-last.Dropped,
+				snap.Canceled-last.Canceled,
+				snap.Failed-last.Failed,
+			)
+			last = snap
+		}
+	}
 }
 
 func getenvFloat(key string, fallback float64) float64 {
