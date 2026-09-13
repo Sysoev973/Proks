@@ -25,7 +25,7 @@
   - **Windows**
 
   ```powershell
-  choco install k6
+  winget install k6
   ```
 
   - **MacOS**
