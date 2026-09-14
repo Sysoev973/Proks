@@ -18,6 +18,7 @@
   ## Установка зависимостей проекта:
 
   ```bash
+  winget install GoLang.Go
   go mod download
   ```
 
