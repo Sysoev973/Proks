@@ -88,7 +88,19 @@ go run main.go
 - **3.2. Терминал 2 (Upstream):**
 
 ```powershell
+$env:DB_DSN="postgres://library_user:library_password@localhost:5432/library_db?sslmode=disable"
+$env:LISTEN_ADDR=":8081"
 go run .\cmd\upstream
+```
+
+Для локального запуска upstream без Docker PostgreSQL должен быть доступен на `localhost:5432`.
+Проверяйте готовность отдельным endpoint, а не запросом к конкретной книге:
+
+```powershell
+curl.exe -i http://localhost:8081/health/live
+curl.exe -i http://localhost:8081/health/ready
+curl.exe -i http://localhost:8080/health/live
+curl.exe -i http://localhost:8080/health/ready
 ```
 
 ## **4. Проверка и тестирование (Терминал 3):**
@@ -198,7 +210,28 @@ go run main.go
 - **4.2. Терминал 2 (Upstream):**
 
 ```bash
+export DB_DSN="postgres://library_user:library_password@localhost:5432/library_db?sslmode=disable"
+export LISTEN_ADDR=":8081"
 go run ./cmd/upstream
+```
+
+Миграция `migrations/001_library_schema.sql` выполняется PostgreSQL только при
+первом создании пустого volume. Изменение этого файла не применяет его к уже
+существующему `pgdata`. Для чистого demo/reset запуска:
+
+```powershell
+docker compose down -v
+docker compose up -d --build postgres
+```
+
+`migrations/reset_demo.sql` является разрушительным reset-скриптом и не
+подключается обычным `docker compose` запуском.
+
+Интеграционный тест PostgreSQL:
+
+```powershell
+$env:TEST_DATABASE_URL="postgres://library_user:library_password@localhost:5432/library_db?sslmode=disable"
+go test .\cmd\upstream -run TestUpstreamAgainstPostgres -v
 ```
 
 ## **5. Проверка и тестирование (Терминал 3):**

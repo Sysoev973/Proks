@@ -34,11 +34,10 @@ func main() {
 	alpha := getenvFloat("EWMA_ALPHA", 0.35)
 	minObs := getenvUint64("EWMA_MIN_OBSERVATIONS", 3)
 	cutoff := getenvFloat("EWMA_CUTOFF", 0.6)
-
 	tracker := predictor.NewTrendTracker(alpha, minObs, cutoff)
 
 	rabbitmqURL := getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
-	broker, err := events.NewRabbitBroker(rabbitmqURL)
+	broker, err := connectRabbitBroker(rabbitmqURL, 60*time.Second)
 	if err != nil {
 		log.Fatalf("failed to connect rabbitmq: %v", err)
 	}
@@ -65,12 +64,17 @@ func main() {
 	go runPrefetchMetricsLoop(context.Background(), pf, h.Metrics(), 2*time.Second)
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/health/live", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/health/ready", newProxyReadinessHandler(upstream))
 	mux.Handle("/metrics", promhttp.HandlerFor(h.MetricsRegistry(), promhttp.HandlerOpts{}))
 	mux.HandleFunc("/internal/events/book.updated", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+
 		var evt events.BookUpdateEvent
 		if err := json.NewDecoder(r.Body).Decode(&evt); err != nil {
 			http.Error(w, "invalid event", http.StatusBadRequest)
@@ -107,12 +111,54 @@ func main() {
 	_ = srv.Shutdown(ctx)
 }
 
+func newProxyReadinessHandler(upstream string) http.HandlerFunc {
+	client := &http.Client{Timeout: 2 * time.Second}
+	return func(w http.ResponseWriter, r *http.Request) {
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstream+"/health/ready", nil)
+		if err != nil {
+			http.Error(w, "upstream is not ready", http.StatusServiceUnavailable)
+			return
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, "upstream is not ready", http.StatusServiceUnavailable)
+			return
+		}
+		defer func() {
+			if err := resp.Body.Close(); err != nil {
+				slog.Debug("failed to close readiness response body", "error", err)
+			}
+		}()
+		if resp.StatusCode != http.StatusOK {
+			http.Error(w, "upstream is not ready", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
 func getenv(key, fallback string) string {
 	v := os.Getenv(key)
 	if v == "" {
 		return fallback
 	}
 	return v
+}
+
+func connectRabbitBroker(amqpURL string, timeout time.Duration) (*events.RabbitBroker, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		broker, err := events.NewRabbitBroker(amqpURL)
+		if err == nil {
+			return broker, nil
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out after %s: %w", timeout, lastErr)
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 func withStructuredLogging(next http.Handler) http.Handler {

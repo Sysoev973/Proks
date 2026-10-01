@@ -208,44 +208,51 @@ func (p *AsyncPrefetcher) SetOutcomeHook(hook func(key string, success bool)) {
 func (p *AsyncPrefetcher) worker() {
 	defer p.wg.Done()
 	for j := range p.jobs {
+		p.process(j)
+	}
+}
+
+func (p *AsyncPrefetcher) process(j job) {
+	defer func() {
 		p.mu.Lock()
 		delete(p.queued, j.key)
 		p.mu.Unlock()
-		if p.fetch == nil {
-			continue
+	}()
+
+	if p.fetch == nil {
+		return
+	}
+	_, err, _ := p.sf.Do(j.key, func() (interface{}, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
+		defer cancel()
+		return nil, p.fetch(ctx, j.key)
+	})
+	if err == nil {
+		atomic.AddUint64(&p.stats.executed, 1)
+		p.mu.RLock()
+		if p.outcomeHook != nil {
+			p.outcomeHook(j.key, true)
 		}
-		_, err, _ := p.sf.Do(j.key, func() (interface{}, error) {
-			ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
-			defer cancel()
-			return nil, p.fetch(ctx, j.key)
-		})
-		if err == nil {
-			atomic.AddUint64(&p.stats.executed, 1)
-			p.mu.RLock()
-			if p.outcomeHook != nil {
-				p.outcomeHook(j.key, true)
-			}
-			p.mu.RUnlock()
-			continue
-		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			atomic.AddUint64(&p.stats.canceled, 1)
-			p.mu.RLock()
-			if p.outcomeHook != nil {
-				p.outcomeHook(j.key, false)
-			}
-			p.mu.RUnlock()
-			p.logf("prefetch canceled key=%s reason=%s err=%v", j.key, j.reason, err)
-			continue
-		}
-		atomic.AddUint64(&p.stats.failed, 1)
+		p.mu.RUnlock()
+		return
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		atomic.AddUint64(&p.stats.canceled, 1)
 		p.mu.RLock()
 		if p.outcomeHook != nil {
 			p.outcomeHook(j.key, false)
 		}
 		p.mu.RUnlock()
-		p.logf("prefetch failed key=%s reason=%s err=%v", j.key, j.reason, err)
+		p.logf("prefetch canceled key=%s reason=%s err=%v", j.key, j.reason, err)
+		return
 	}
+	atomic.AddUint64(&p.stats.failed, 1)
+	p.mu.RLock()
+	if p.outcomeHook != nil {
+		p.outcomeHook(j.key, false)
+	}
+	p.mu.RUnlock()
+	p.logf("prefetch failed key=%s reason=%s err=%v", j.key, j.reason, err)
 }
 
 func (p *AsyncPrefetcher) logf(format string, args ...interface{}) {

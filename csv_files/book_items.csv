@@ -1,0 +1,7 @@
+item_id,book_id,branch_id,inventory_number,status
+1,1,1,INV-2024-001,Borrowed
+2,1,2,INV-2024-002,Available
+3,2,1,INV-RARE-001,In Reading Room
+4,3,2,INV-2024-003,Borrowed
+5,4,3,INV-2024-004,Available
+6,5,1,INV-2024-005,Borrowed

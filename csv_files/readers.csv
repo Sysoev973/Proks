@@ -1,0 +1,6 @@
+reader_id,card_number,full_name,phone,email,status,created_at
+1,RD-1001,Иванов Иван Иванович,+7 (916) 100-20-30,ivanov@example.com,Active,2024-01-15 10:00:00+03
+2,RD-1002,Петрова Анна Сергеевна,+7 (916) 200-30-40,petrova@example.com,Active,2024-02-10 11:30:00+03
+3,RD-1003,Сидоров Алексей Михайлович,+7 (916) 300-40-50,sidorov@example.com,Active,2024-03-05 14:15:00+03
+4,RD-1004,Кузнецова Елена Павловна,+7 (916) 400-50-60,kuznetsova@example.com,Blocked,2023-11-20 09:00:00+03
+5,RD-1005,Смирнов Дмитрий Васильевич,+7 (916) 500-60-70,smirnov@example.com,Active,2024-04-01 16:45:00+03

@@ -1,0 +1,3 @@
+fine_id,loan_id,amount,status,calculated_at,paid_at
+1,2,150.00,Paid,2024-04-01 09:00:00+03,2024-04-05 14:05:00+03
+2,3,350.00,Unpaid,2024-03-23 09:00:00+03,
