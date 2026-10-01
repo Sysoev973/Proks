@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"context"
 	"errors"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -22,15 +23,15 @@ const (
 type CacheReason string
 
 const (
-	ReasonLRU         CacheReason = "LRU"
-	ReasonMarkov      CacheReason = "MARKOV"
-	ReasonStale       CacheReason = "STALE"
-	ReasonInvalidated CacheReason = "INVALIDATED"
+	ReasonLRU    CacheReason = "LRU"
+	ReasonMarkov CacheReason = "MARKOV"
+	ReasonStale  CacheReason = "STALE"
 )
 
 type Item struct {
 	Key        string
 	Value      []byte
+	Headers    http.Header
 	StatusCode int
 	ExpiresAt  time.Time
 	Version    int64
@@ -122,8 +123,7 @@ func (c *InMemoryCache) Get(_ context.Context, key string) (Item, error) {
 		return Item{}, ErrNotFound
 	}
 	c.lru.MoveToFront(e.ele)
-	cloned := e.item
-	cloned.Value = cloneBytes(e.item.Value)
+	cloned := copyItem(e.item)
 	return cloned, nil
 }
 
@@ -209,6 +209,7 @@ func (c *InMemoryCache) removeLocked(key string) {
 
 func copyItem(item Item) Item {
 	item.Value = cloneBytes(item.Value)
+	item.Headers = item.Headers.Clone()
 	return item
 }
 

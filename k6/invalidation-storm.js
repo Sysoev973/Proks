@@ -9,17 +9,16 @@ export const options = {
 export default function () {
   const mode = Math.random();
   if (mode < 0.9) {
-    const res = http.get('http://localhost:8080/books/42?tenant=acme&locale=ru');
+    const res = http.get('http://proxy:8080/books/1?tenant=acme&locale=ru');
     check(res, { 'status is 200': (r) => r.status === 200 });
     return;
   }
-  const payload = JSON.stringify({ book_id: '42', version: 1000, type: 'book.updated' });
-  const res = http.get('http://localhost:8080/books/42', {
+  const version = __VU * 1000000 + __ITER + 1;
+  const payload = JSON.stringify({ book_id: '1', version, type: 'book.updated' });
+  const res = http.post('http://proxy:8080/internal/events/book.updated', payload, {
     headers: {
-      'X-User-ID': `user-${__VU}`,
-      'X-Tenant': 'acme',
-      'X-Locale': 'ru',
+      'Content-Type': 'application/json',
     },
   });
-  check(res, { 'event accepted': (r) => r.status >= 200 && r.status < 300 });
+  check(res, { 'event accepted': (r) => r.status === 202 });
 }

@@ -14,7 +14,8 @@ export const options = {
 };
 
 export default function () {
-  const res = http.get('http://localhost:8080/books/42', {
+  const bookID = Math.random() < 0.7 ? '1' : '2';
+  const res = http.get(`http://proxy:8080/books/${bookID}`, {
     headers: {
       'X-User-ID': `user-${__VU}`,
       'X-Tenant': 'acme',

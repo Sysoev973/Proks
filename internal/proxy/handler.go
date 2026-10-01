@@ -124,6 +124,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			reason = string(cache.ReasonLRU)
 		}
 
+		if item.Headers != nil {
+			copyHeaders(w.Header(), item.Headers)
+		}
 		w.Header().Set("X-Cache-Status", status)
 		w.Header().Set("X-Cache-Reason", reason)
 		statusCode := item.StatusCode
@@ -154,6 +157,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	stored := h.cache.Set(ctx, cache.Item{
 		Key:        key,
 		Value:      respBytes,
+		Headers:    hdr,
 		StatusCode: code,
 		ExpiresAt:  time.Now().Add(h.defaultTTL),
 		Version:    h.versionFromRequest(r),

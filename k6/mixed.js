@@ -10,8 +10,8 @@ export const options = {
 };
 
 export default function () {
-  const path = Math.random() < 0.7 ? '/books/42' : '/books/99';
-  const res = http.get('http://localhost:8080/books/42', {
+  const path = Math.random() < 0.7 ? '/books/1' : '/books/2';
+  const res = http.get(`http://proxy:8080${path}`, {
     headers: {
       'X-User-ID': `user-${__VU}`,
       'X-Tenant': 'acme',

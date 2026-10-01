@@ -1,17 +1,33 @@
-version: '3.9'
 services:
-  proxy:
-    build: .
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "5432:5432"
     environment:
-      UPSTREAM_URL: http://upstream:8081
-      LISTEN_ADDR: :8080
-    depends_on:
-      - upstream
-      - prometheus
-      - grafana
-      - rabbitmq
+      POSTGRES_USER: library_user
+      POSTGRES_PASSWORD: library_password
+      POSTGRES_DB: library_db
+    volumes:
+      - ./migrations/001_library_schema.sql:/docker-entrypoint-initdb.d/001_library_schema.sql:ro
+      - ./csv_files:/tmp/csv_files:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U library_user -d library_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   upstream:
     build:
@@ -19,12 +35,39 @@ services:
       dockerfile: Dockerfile.upstream
     ports:
       - "8081:8081"
+    environment:
+      DB_DSN: "postgres://library_user:library_password@postgres:5432/library_db?sslmode=disable"
+      LISTEN_ADDR: ":8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8081/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
 
-  rabbitmq:
-    image: rabbitmq:3-management
+  proxy:
+    build: .
+    restart: on-failure
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - "8080:8080"
+    environment:
+      UPSTREAM_URL: "http://upstream:8081"
+      LISTEN_ADDR: ":8080"
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+    depends_on:
+      upstream:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      prometheus:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8080/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
 
   prometheus:
     image: prom/prometheus:v2.54.1
@@ -45,11 +88,17 @@ services:
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
+    depends_on:
+      - prometheus
 
   k6:
     image: grafana/k6:latest
     depends_on:
-      - proxy
+      proxy:
+        condition: service_healthy
     volumes:
       - ./k6:/scripts
     entrypoint: ["sh", "-c", "sleep 15; k6 run /scripts/read-heavy.js --vus 10 --duration 30s"]
+
+volumes:
+  pgdata:

@@ -18,7 +18,7 @@ export const options = {
 };
 
 export default function () {
-  const res = http.get('http://localhost:8080/books/42', {
+  const res = http.get('http://proxy:8080/books/1', {
     headers: {
       'X-User-ID': `user-${__VU}`,
       'X-Tenant': 'acme',
