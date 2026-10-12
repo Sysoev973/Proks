@@ -39,24 +39,24 @@ func TestBuildCacheKeyNormalizesQueryAndRoute(t *testing.T) {
 	req.Header.Set("X-Locale", "ru")
 
 	key := BuildCacheKey(req)
-	if key != "u1|t1|ru|book_view:123|a=1,3&b=2" {
+	if key != "u1|t1|ru|book_view:123|a=1,3&b=2|vary:Accept-Encoding=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" {
 		t.Fatalf("unexpected key: %s", key)
 	}
 }
 
 func TestServeHTTPHit(t *testing.T) {
 	c := cache.NewInMemoryCache(10, nil)
-	_ = c.Set(context.Background(), cache.Item{Key: "u|t|l|book_view:1|", Value: []byte("cached"), StatusCode: http.StatusAccepted, ExpiresAt: time.Now().Add(time.Minute)}, cache.Metrics{})
+	req := httptest.NewRequest(http.MethodGet, "/books/1", nil)
+	req.Header.Set("X-User-ID", "u")
+	req.Header.Set("X-Tenant", "t")
+	req.Header.Set("X-Locale", "l")
+	_ = c.Set(context.Background(), cache.Item{Key: BuildCacheKey(req), Value: []byte("cached"), StatusCode: http.StatusAccepted, ExpiresAt: time.Now().Add(time.Minute)}, cache.Metrics{})
 
 	h, err := NewHandler(c, predictor.NewMarkov(), noopPrefetcher{}, "http://example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/books/1", nil)
-	req.Header.Set("X-User-ID", "u")
-	req.Header.Set("X-Tenant", "t")
-	req.Header.Set("X-Locale", "l")
 	rr := httptest.NewRecorder()
 
 	h.ServeHTTP(rr, req)
@@ -320,7 +320,7 @@ func TestE2EBook(t *testing.T) {
 	}
 
 	// Отправка события обновления книги через HTTP POST
-	body := strings.NewReader(`{"book_id": "123", "version": 1}`)
+	body := strings.NewReader(`{"type":"book.updated","book_id": "123", "version": 1}`)
 	eventReq := httptest.NewRequest(http.MethodPost, "/internal/events/book.updated", body)
 	eventReq.Header.Set("Content-Type", "application/json")
 	eventRec := httptest.NewRecorder()
