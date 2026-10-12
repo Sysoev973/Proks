@@ -73,8 +73,9 @@ type alwaysAdmission struct{}
 func (alwaysAdmission) ShouldStore(_ Item, _ Metrics) bool { return true }
 
 type entry struct {
-	item Item
-	ele  *list.Element
+	item  Item
+	ele   *list.Element
+	timer *time.Timer
 }
 
 type InMemoryCache struct {
@@ -83,6 +84,13 @@ type InMemoryCache struct {
 	lru       *list.List
 	capacity  int
 	admission AdmissionPolicy
+	onEvict   func(string)
+}
+
+func (c *InMemoryCache) SetEvictionCallback(callback func(string)) {
+	c.mu.Lock()
+	c.onEvict = callback
+	c.mu.Unlock()
 }
 
 func NewInMemoryCache(capacity int, admission AdmissionPolicy) *InMemoryCache {
@@ -149,12 +157,16 @@ func (c *InMemoryCache) Set(_ context.Context, item Item, metrics Metrics) bool 
 	}
 
 	if e, ok := c.items[item.Key]; ok {
+		if e.timer != nil {
+			e.timer.Stop()
+		}
 		e.item = copyItem(item)
+		e.timer = c.expirationTimer(item.Key, item.ExpiresAt)
 		c.lru.MoveToFront(e.ele)
 		return true
 	}
 	ele := c.lru.PushFront(item.Key)
-	c.items[item.Key] = &entry{item: copyItem(item), ele: ele}
+	c.items[item.Key] = &entry{item: copyItem(item), ele: ele, timer: c.expirationTimer(item.Key, item.ExpiresAt)}
 	if len(c.items) > c.capacity {
 		back := c.lru.Back()
 		if back != nil {
@@ -205,6 +217,29 @@ func (c *InMemoryCache) removeLocked(key string) {
 	}
 	delete(c.items, key)
 	c.lru.Remove(e.ele)
+	if e.timer != nil {
+		e.timer.Stop()
+	}
+	if c.onEvict != nil {
+		c.onEvict(key)
+	}
+}
+
+func (c *InMemoryCache) expirationTimer(key string, expiresAt time.Time) *time.Timer {
+	if expiresAt.IsZero() {
+		return nil
+	}
+	delay := time.Until(expiresAt)
+	if delay < 0 {
+		delay = 0
+	}
+	return time.AfterFunc(delay, func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if e, ok := c.items[key]; ok && !e.item.ExpiresAt.IsZero() && !time.Now().Before(e.item.ExpiresAt) {
+			c.removeLocked(key)
+		}
+	})
 }
 
 func copyItem(item Item) Item {

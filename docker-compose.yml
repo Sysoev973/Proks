@@ -55,7 +55,12 @@ services:
     environment:
       UPSTREAM_URL: "http://upstream:8081"
       LISTEN_ADDR: ":8080"
+      PROXY_REPLICA_ID: "proxy-1"
+      EVENT_VERSION_STATE_PATH: "/var/lib/proks/events/state.json"
+      EVENT_LOG_PATH: "/var/lib/proks/events/events.log"
       RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+    volumes:
+      - proxy-events:/var/lib/proks/events
     depends_on:
       upstream:
         condition: service_healthy
@@ -102,3 +107,4 @@ services:
 
 volumes:
   pgdata:
+  proxy-events:

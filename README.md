@@ -82,6 +82,9 @@ docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
 - **3.1. Терминал 1 (Прокси-сервер):**
 
 ```powershell
+$env:PROXY_REPLICA_ID="proxy-local"
+$env:EVENT_VERSION_STATE_PATH="$PWD\data\events\state.json"
+$env:EVENT_LOG_PATH="$PWD\data\events\events.log"
 go run main.go
 ```
 
@@ -102,6 +105,16 @@ curl.exe -i http://localhost:8081/health/ready
 curl.exe -i http://localhost:8080/health/live
 curl.exe -i http://localhost:8080/health/ready
 ```
+
+## Политика кэширования
+
+Политика задаётся через `proxy.CachePolicy` и передаётся в `NewHandlerWithPolicy`. По умолчанию кэшируются только успешные `GET`-ответы с TTL 5 минут. Запросы с `Authorization` или `Cookie`, а также ответы с `Set-Cookie`, `Cache-Control: private/no-store` и неподдерживаемым `Vary` обходят кэш и всегда идут в upstream. При явном разрешении персонализированного кэша значения `Authorization` и `Cookie` представлены в ключе только SHA-256 fingerprint, а не исходным секретом.
+
+Для RabbitMQ каждая реплика использует собственную durable-очередь. Обязательная переменная `PROXY_REPLICA_ID` должна быть стабильной и уникальной для реплики; без неё RabbitMQ-брокер не запускается. Для сохранения deduplication-версий между перезапусками задайте `EVENT_VERSION_STATE_PATH` на постоянный том.
+
+Publisher использует persistent messages и RabbitMQ publisher confirms. `EVENT_LOG_PATH` и `EVENT_VERSION_STATE_PATH` обязательны для RabbitMQ-брокера: событие перед публикацией добавляется в durable append-only event log, а обработанные `event_id` и версии сохраняются атомарно. Event log повторно проигрывается при старте consumer-а и покрывает события, опубликованные до создания очереди. Для нескольких независимых узлов event log должен находиться на общем durable-хранилище либо быть заменён PostgreSQL outbox/RabbitMQ Stream.
+
+Publisher имеет отдельное AMQP-соединение и автоматически переподключает channel/connection после `NotifyClose` или ошибки подтверждения. Публикация сериализована, поэтому confirmation однозначно относится к текущему `event_id`; после переподключения событие повторяется с тем же идентификатором.
 
 ## **4. Проверка и тестирование (Терминал 3):**
 
@@ -204,6 +217,9 @@ docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
 - **4.1. Терминал 1 (Прокси-сервер):**
 
 ```bash
+export PROXY_REPLICA_ID="proxy-local"
+export EVENT_VERSION_STATE_PATH="$PWD/data/events/state.json"
+export EVENT_LOG_PATH="$PWD/data/events/events.log"
 go run main.go
 ```
 

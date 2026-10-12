@@ -5,9 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	_ "fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -27,10 +27,30 @@ import (
 
 const maxRequestBodySize = 10 * 1024 * 1024
 
+var (
+	errRequestBodyTooLarge  = errors.New("proxy: request body exceeds configured maximum size")
+	errResponseBodyTooLarge = errors.New("proxy: upstream response body exceeds configured maximum size")
+	errStreamingUnsupported = errors.New("proxy: streaming responses are not supported by this policy")
+)
+
 var bufferPool = sync.Pool{
 	New: func() interface{} {
 		return new(bytes.Buffer)
 	},
+}
+
+func setBufferedContentLength(headers http.Header, size int) {
+	headers.Set("Content-Length", strconv.Itoa(size))
+}
+
+func isStreamingResponse(resp *http.Response) bool {
+	if resp == nil {
+		return false
+	}
+	if resp.ContentLength < 0 || len(resp.TransferEncoding) > 0 {
+		return true
+	}
+	return strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
 }
 
 type Handler struct {
@@ -41,16 +61,28 @@ type Handler struct {
 	upstream          *url.URL
 	httpClient        *http.Client
 	prefetchThreshold float64
-	defaultTTL        time.Duration
 	prefetchedMu      sync.Mutex
 	prefetched        map[string]time.Time
 	eventStream       events.Stream
 	metrics           *observability.Metrics
+	policy            CachePolicy
 	indexMu           sync.RWMutex
-	bookKeys          map[string]map[string]struct{} // bookID - множество cache keys
+	resourceKeys      map[string]map[string]struct{}
+	keyResources      map[string]map[string]struct{}
+}
+
+type upstreamResponse struct {
+	body    []byte
+	status  int
+	headers http.Header
+	stream  io.ReadCloser
 }
 
 func NewHandler(cache cache.Cache, pred predictor.Predictor, pf prefetcher.Prefetcher, upstream string) (*Handler, error) {
+	return NewHandlerWithPolicy(cache, pred, pf, upstream, DefaultCachePolicy())
+}
+
+func NewHandlerWithPolicy(cache cache.Cache, pred predictor.Predictor, pf prefetcher.Prefetcher, upstream string, policy CachePolicy) (*Handler, error) {
 	u, err := url.Parse(upstream)
 	if err != nil {
 		return nil, err
@@ -62,10 +94,11 @@ func NewHandler(cache cache.Cache, pred predictor.Predictor, pf prefetcher.Prefe
 		trend:             predictor.NewTrendTracker(0.35, 3, 0.6),
 		upstream:          u,
 		prefetchThreshold: 0.7,
-		defaultTTL:        5 * time.Minute,
 		prefetched:        make(map[string]time.Time),
 		metrics:           observability.NewMetrics(),
-		bookKeys:          make(map[string]map[string]struct{}),
+		policy:            policy.normalized(),
+		resourceKeys:      make(map[string]map[string]struct{}),
+		keyResources:      make(map[string]map[string]struct{}),
 		httpClient: &http.Client{
 			Timeout: 2 * time.Second,
 			Transport: &http.Transport{
@@ -76,7 +109,22 @@ func NewHandler(cache cache.Cache, pred predictor.Predictor, pf prefetcher.Prefe
 			},
 		},
 	}
+	if evicting, ok := cache.(interface{ SetEvictionCallback(func(string)) }); ok {
+		evicting.SetEvictionCallback(h.removeIndexedKey)
+	}
 	return h, nil
+}
+
+func (h *Handler) removeIndexedKey(key string) {
+	h.indexMu.Lock()
+	defer h.indexMu.Unlock()
+	for resourceID := range h.keyResources[key] {
+		delete(h.resourceKeys[resourceID], key)
+		if len(h.resourceKeys[resourceID]) == 0 {
+			delete(h.resourceKeys, resourceID)
+		}
+	}
+	delete(h.keyResources, key)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -92,9 +140,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(w, "cache_capacity %d\n", h.cache.Capacity())
 		return
 	}
-
 	ctx := r.Context()
-	key := BuildCacheKey(r)
+	decision := h.policy.requestDecision(r)
+	key := decision.Key
+	if key == "" {
+		key = BuildCacheKey(r)
+	}
 	status := string(cache.StatusMiss)
 	reason := string(cache.ReasonLRU)
 
@@ -111,35 +162,38 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		)
 	}()
 
-	if item, err := h.cache.Get(ctx, key); err == nil {
-		h.recordAccess(key)
-		current := normalizeRouteKey(r)
-		h.recordTransition(r, current)
-		if h.consumePrefetchSignal(key) {
-			h.recordTrend(key, true)
-			status = string(cache.StatusPrefetch)
-			reason = string(cache.ReasonMarkov)
-		} else {
-			status = string(cache.StatusHit)
-			reason = string(cache.ReasonLRU)
-		}
+	if decision.Allowed {
+		if item, err := h.cache.Get(ctx, key); err == nil {
+			h.recordAccess(key)
+			current := normalizeRouteKey(r)
+			h.recordTransition(r, current)
+			if h.consumePrefetchSignal(key) {
+				h.recordTrend(key, true)
+				status = string(cache.StatusPrefetch)
+				reason = string(cache.ReasonMarkov)
+			} else {
+				status = string(cache.StatusHit)
+				reason = string(cache.ReasonLRU)
+			}
 
-		if item.Headers != nil {
-			copyHeaders(w.Header(), item.Headers)
+			if item.Headers != nil {
+				copyHeaders(w.Header(), item.Headers)
+			}
+			setBufferedContentLength(w.Header(), len(item.Value))
+			w.Header().Set("X-Cache-Status", status)
+			w.Header().Set("X-Cache-Reason", reason)
+			statusCode := item.StatusCode
+			if statusCode == 0 {
+				statusCode = http.StatusOK
+			}
+			w.WriteHeader(statusCode)
+			_, _ = w.Write(item.Value)
+			h.maybePrefetchForRequest(ctx, r, current)
+			return
 		}
-		w.Header().Set("X-Cache-Status", status)
-		w.Header().Set("X-Cache-Reason", reason)
-		statusCode := item.StatusCode
-		if statusCode == 0 {
-			statusCode = http.StatusOK
-		}
-		w.WriteHeader(statusCode)
-		_, _ = w.Write(item.Value)
-		h.maybePrefetchForRequest(ctx, r, current)
-		return
 	}
 
-	respBytes, code, hdr, err := h.fetchUpstream(ctx, r)
+	upstream, err := h.fetchUpstream(ctx, r)
 	if err != nil {
 		if h.metrics != nil {
 			kind := "other"
@@ -148,30 +202,73 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			h.metrics.RecordUpstreamError(kind)
 		}
+		if errors.Is(err, errRequestBodyTooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			status = string(cache.StatusBypass)
+			reason = "BODY_SIZE"
+			w.Header().Set("X-Cache-Status", status)
+			w.Header().Set("X-Cache-Reason", reason)
+			return
+		}
+		if errors.Is(err, errResponseBodyTooLarge) {
+			http.Error(w, "upstream response body too large", http.StatusBadGateway)
+			status = string(cache.StatusBypass)
+			reason = "BODY_SIZE"
+			w.Header().Set("X-Cache-Status", status)
+			w.Header().Set("X-Cache-Reason", reason)
+			return
+		}
+		if errors.Is(err, errStreamingUnsupported) {
+			http.Error(w, "streaming response is not supported", http.StatusBadGateway)
+			status = string(cache.StatusBypass)
+			reason = "STREAMING"
+			w.Header().Set("X-Cache-Status", status)
+			w.Header().Set("X-Cache-Reason", reason)
+			return
+		}
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
 		return
 	}
 
-	metrics := h.computeMetrics(key)
-	h.recordAccess(key)
-	stored := h.cache.Set(ctx, cache.Item{
-		Key:        key,
-		Value:      respBytes,
-		Headers:    hdr,
-		StatusCode: code,
-		ExpiresAt:  time.Now().Add(h.defaultTTL),
-		Version:    h.versionFromRequest(r),
-	}, metrics)
-	if stored {
-		if bookID := extractBookIDFromRoute(key); bookID != "" {
-			h.registerBookKey(bookID, key)
+	if upstream.stream != nil {
+		copyHeaders(w.Header(), upstream.headers)
+		w.Header().Del("Content-Length")
+		w.Header().Set("X-Cache-Status", string(cache.StatusBypass))
+		w.Header().Set("X-Cache-Reason", "STREAMING")
+		w.WriteHeader(upstream.status)
+		if err := streamResponse(r.Context(), w, upstream.stream); err != nil && !errors.Is(err, context.Canceled) {
+			slog.Warn("streaming response failed", "error", err)
 		}
+		_ = upstream.stream.Close()
+		status = string(cache.StatusBypass)
+		reason = "STREAMING"
+		return
+	}
+	respBytes, code, hdr := upstream.body, upstream.status, upstream.headers
+	responseDecision, ttl := h.policy.responseDecision(r, code, hdr, len(respBytes))
+	stored := false
+	var metrics cache.Metrics
+	if decision.Allowed && responseDecision.Allowed {
+		metrics = h.computeMetrics(key)
+		h.recordAccess(key)
+		stored = h.cache.Set(ctx, cache.Item{
+			Key:        key,
+			Value:      respBytes,
+			Headers:    hdr,
+			StatusCode: code,
+			ExpiresAt:  time.Now().Add(ttl),
+			Version:    versionFromResponse(hdr),
+		}, metrics)
+	}
+	if stored {
+		h.registerResources(resourcesForRequest(r, hdr), key)
 	}
 	if h.metrics != nil {
 		h.metrics.RecordPollution(metrics.Pollution)
 	}
 
 	copyHeaders(w.Header(), hdr)
+	setBufferedContentLength(w.Header(), len(respBytes))
 	if stored {
 		status = string(cache.StatusMiss)
 		reason = string(cache.ReasonLRU)
@@ -179,7 +276,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Cache-Reason", reason)
 	} else {
 		status = string(cache.StatusBypass)
-		reason = string(cache.ReasonStale)
+		if !decision.Allowed {
+			reason = decision.Reason
+		} else {
+			reason = responseDecision.Reason
+		}
 		w.Header().Set("X-Cache-Status", status)
 		w.Header().Set("X-Cache-Reason", reason)
 	}
@@ -189,18 +290,57 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	current := normalizeRouteKey(r)
 	h.recordTransition(r, current)
-	h.maybePrefetchForRequest(ctx, r, current)
+	if decision.Allowed {
+		h.maybePrefetchForRequest(ctx, r, current)
+	}
 }
 
 func (h *Handler) InvalidateBook(ctx context.Context, key string) {
 	if key == "" || h.cache == nil {
 		return
 	}
-	for _, candidate := range h.cache.Snapshot(ctx).Keys {
-		if candidate == key || strings.Contains(candidate, "book_view:"+key) || strings.Contains(candidate, "book:"+key) || strings.Contains(candidate, "book_id="+key) || strings.Contains(candidate, key+"|") {
-			h.cache.Delete(ctx, candidate)
+	h.invalidateResource(ctx, "book:"+key, 0)
+}
+
+func (h *Handler) invalidateResource(ctx context.Context, resourceID string, version int64) {
+	h.indexMu.Lock()
+	keys := make(map[string]struct{})
+	indexedResources := make([]string, 0)
+	for id, indexedKeys := range h.resourceKeys {
+		if id == resourceID {
+			indexedResources = append(indexedResources, id)
+			for key := range indexedKeys {
+				keys[key] = struct{}{}
+			}
 		}
 	}
+	h.indexMu.Unlock()
+	if len(keys) == 0 {
+		for _, key := range h.cache.Snapshot(ctx).Keys {
+			if cacheKeyBookID(key) == strings.TrimPrefix(resourceID, "book:") {
+				keys[key] = struct{}{}
+			}
+		}
+	}
+	deleted := make(map[string]struct{})
+	for key := range keys {
+		item, err := h.cache.Get(ctx, key)
+		if err != nil || version == 0 || item.Version == 0 || item.Version <= version {
+			h.cache.Delete(ctx, key)
+			deleted[key] = struct{}{}
+		}
+	}
+	h.indexMu.Lock()
+	for _, resource := range indexedResources {
+		for key := range deleted {
+			delete(h.resourceKeys[resource], key)
+			delete(h.keyResources, key)
+		}
+		if len(h.resourceKeys[resource]) == 0 {
+			delete(h.resourceKeys, resource)
+		}
+	}
+	h.indexMu.Unlock()
 }
 
 func requestIDFromContext(ctx context.Context) string {
@@ -220,22 +360,13 @@ func (h *Handler) MetricsRegistry() *prometheus.Registry {
 	return h.metrics.Registry()
 }
 
-func (h *Handler) versionFromRequest(r *http.Request) int64 {
-	if r == nil {
+func versionFromResponse(headers http.Header) int64 {
+	value := headers.Get("X-Upstream-Book-Version")
+	version, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || version < 0 {
 		return 0
 	}
-	if v := r.Header.Get("X-Book-Version"); v != "" {
-		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
-			return parsed
-		}
-	}
-	if q := r.URL.Query(); q.Get("version") != "" {
-		v, err := strconv.ParseInt(q.Get("version"), 10, 64)
-		if err == nil {
-			return v
-		}
-	}
-	return 0
+	return version
 }
 
 func (h *Handler) SetEventStream(stream events.Stream) {
@@ -251,41 +382,14 @@ func (h *Handler) StartEventConsumer(ctx context.Context) error {
 }
 
 func (h *Handler) HandleBookUpdated(ctx context.Context, event events.BookUpdateEvent) error {
-	if event.BookID == "" || h.cache == nil {
+	if err := events.ValidateBookUpdateEvent(event); err != nil {
+		return err
+	}
+	if h.cache == nil {
 		return nil
 	}
 
-	h.indexMu.Lock()
-	keysToDeleteMap, exists := h.bookKeys[event.BookID]
-	if exists {
-		delete(h.bookKeys, event.BookID)
-	}
-	h.indexMu.Unlock()
-
-	var keysToDelete []string
-
-	if exists && len(keysToDeleteMap) > 0 {
-		for k := range keysToDeleteMap {
-			keysToDelete = append(keysToDelete, k)
-		}
-	} else {
-		snap := h.cache.Snapshot(ctx)
-		for _, key := range snap.Keys {
-			if extractedID := extractBookIDFromRoute(key); extractedID == event.BookID || strings.Contains(key, event.BookID) {
-				keysToDelete = append(keysToDelete, key)
-			}
-		}
-	}
-
-	for _, key := range keysToDelete {
-		if item, err := h.cache.Get(ctx, key); err == nil {
-			if event.Version == 0 || item.Version == 0 || item.Version <= event.Version {
-				h.cache.Delete(ctx, key)
-			}
-		} else {
-			h.cache.Delete(ctx, key)
-		}
-	}
+	h.invalidateResource(ctx, "book:"+event.BookID, event.Version)
 
 	if h.metrics != nil {
 		h.metrics.RecordRequest("MISS", "INVALIDATED", 0)
@@ -457,7 +561,7 @@ func (h *Handler) maybePrefetchForRequest(ctx context.Context, r *http.Request, 
 	}
 	prefetchKey := top.Key
 	if r != nil {
-		prefetchKey = buildScopedCacheKey(r, top.Key)
+		prefetchKey = buildPolicyCacheKeyForRoute(r, top.Key, h.policy)
 	}
 	if _, err := h.cache.Get(cacheCtx, prefetchKey); err == nil {
 		return
@@ -511,18 +615,17 @@ func (h *Handler) cacheIsPolluted(candidateKey string) bool {
 }
 
 func BuildCacheKey(r *http.Request) string {
-	return buildScopedCacheKey(r, normalizeRouteKey(r))
+	if r == nil {
+		return ""
+	}
+	return buildPolicyCacheKey(r, DefaultCachePolicy())
 }
 
 func buildScopedCacheKey(r *http.Request, route string) string {
 	if r == nil {
 		return route
 	}
-	userID := r.Header.Get("X-User-ID")
-	tenant := r.Header.Get("X-Tenant")
-	locale := r.Header.Get("X-Locale")
-	query := normalizeQuery(r.URL.Query())
-	return strings.Join([]string{userID, tenant, locale, route, query}, "|")
+	return buildPolicyCacheKeyForRoute(r, route, DefaultCachePolicy())
 }
 
 func normalizeRouteKey(r *http.Request) string {
@@ -558,15 +661,24 @@ func normalizeQuery(v url.Values) string {
 	return strings.Join(parts, "&")
 }
 
-func (h *Handler) fetchUpstream(ctx context.Context, in *http.Request) ([]byte, int, http.Header, error) {
+func (h *Handler) fetchUpstream(ctx context.Context, in *http.Request) (upstreamResponse, error) {
+	var empty upstreamResponse
+	policy := h.policy.normalized()
 	if in.Body != nil && in.Body != http.NoBody {
 		buf := bufferPool.Get().(*bytes.Buffer)
 		buf.Reset()
 		defer bufferPool.Put(buf)
 
-		limitedReader := io.LimitReader(in.Body, maxRequestBodySize)
+		maxBodySize := policy.MaxBodySize
+		if in.ContentLength > maxBodySize {
+			return empty, errRequestBodyTooLarge
+		}
+		limitedReader := io.LimitReader(in.Body, maxBodySize+1)
 		if _, err := buf.ReadFrom(limitedReader); err != nil {
-			return nil, 0, nil, err
+			return empty, err
+		}
+		if int64(buf.Len()) > maxBodySize {
+			return empty, errRequestBodyTooLarge
 		}
 		_ = in.Body.Close()
 
@@ -580,13 +692,26 @@ func (h *Handler) fetchUpstream(ctx context.Context, in *http.Request) ([]byte, 
 	upstreamURL := h.upstream.ResolveReference(&url.URL{Path: in.URL.Path, RawQuery: in.URL.RawQuery}).String()
 	outReq, err := http.NewRequestWithContext(ctx, in.Method, upstreamURL, in.Body)
 	if err != nil {
-		return nil, 0, nil, err
+		return empty, err
 	}
-	outReq.Header = in.Header.Clone()
+	outReq.Header = prepareUpstreamHeaders(in, policy.TrustForwardedHeaders)
 
-	resp, err := h.httpClient.Do(outReq)
+	client := h.httpClient
+	if policy.AllowStreaming {
+		streamingClient := *h.httpClient
+		streamingClient.Timeout = 0
+		client = &streamingClient
+	}
+	resp, err := client.Do(outReq)
 	if err != nil {
-		return nil, 0, nil, err
+		return empty, err
+	}
+	if !policy.AllowStreaming && isStreamingResponse(resp) {
+		_ = resp.Body.Close()
+		return empty, errStreamingUnsupported
+	}
+	if policy.AllowStreaming && isStreamingResponse(resp) {
+		return upstreamResponse{status: resp.StatusCode, headers: resp.Header.Clone(), stream: resp.Body}, nil
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -594,19 +719,34 @@ func (h *Handler) fetchUpstream(ctx context.Context, in *http.Request) ([]byte, 
 	bufResp.Reset()
 	defer bufferPool.Put(bufResp)
 
-	limitedRespReader := io.LimitReader(resp.Body, maxRequestBodySize)
+	maxBodySize := policy.MaxBodySize
+	if resp.ContentLength > maxBodySize {
+		return empty, errResponseBodyTooLarge
+	}
+	limitedRespReader := io.LimitReader(resp.Body, maxBodySize+1)
 	if _, err := bufResp.ReadFrom(limitedRespReader); err != nil {
-		return nil, 0, nil, err
+		return empty, err
+	}
+	if int64(bufResp.Len()) > maxBodySize {
+		return empty, errResponseBodyTooLarge
 	}
 
 	respBodyCopy := make([]byte, bufResp.Len())
 	copy(respBodyCopy, bufResp.Bytes())
 
-	return respBodyCopy, resp.StatusCode, resp.Header.Clone(), nil
+	return upstreamResponse{body: respBodyCopy, status: resp.StatusCode, headers: resp.Header.Clone()}, nil
 }
 
 func copyHeaders(dst, src http.Header) {
+	connectionHeaders := make(map[string]bool)
+	for _, name := range hopByHopHeaders(src) {
+		connectionHeaders[http.CanonicalHeaderKey(name)] = true
+	}
 	for k, vals := range src {
+		if isHopByHopHeader(k) || connectionHeaders[http.CanonicalHeaderKey(k)] ||
+			strings.EqualFold(k, "X-Upstream-Book-Version") {
+			continue
+		}
 		dst.Del(k)
 		for _, v := range vals {
 			dst.Add(k, v)
@@ -614,21 +754,156 @@ func copyHeaders(dst, src http.Header) {
 	}
 }
 
+func isHopByHopHeader(name string) bool {
+	switch strings.ToLower(name) {
+	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+		"te", "trailer", "transfer-encoding", "upgrade":
+		return true
+	default:
+		return false
+	}
+}
+
+func hopByHopHeaders(headers http.Header) []string {
+	var names []string
+	for _, value := range headers.Values("Connection") {
+		for _, name := range strings.Split(value, ",") {
+			if strings.TrimSpace(name) != "" {
+				names = append(names, strings.TrimSpace(name))
+			}
+		}
+	}
+	return names
+}
+
+func prepareUpstreamHeaders(request *http.Request, trustForwarded bool) http.Header {
+	out := request.Header.Clone()
+	connectionHeaders := make(map[string]bool)
+	for _, name := range hopByHopHeaders(out) {
+		connectionHeaders[http.CanonicalHeaderKey(name)] = true
+	}
+	for name := range out {
+		if isHopByHopHeader(name) || connectionHeaders[http.CanonicalHeaderKey(name)] ||
+			strings.EqualFold(name, "X-Upstream-Book-Version") {
+			out.Del(name)
+		}
+	}
+	out.Del("X-Book-Version")
+	clientIP := request.RemoteAddr
+	if host, _, err := net.SplitHostPort(clientIP); err == nil {
+		clientIP = host
+	}
+	if !trustForwarded {
+		out.Del("X-Forwarded-For")
+	}
+	appendForwarded(out, "X-Forwarded-For", clientIP)
+	proto := "http"
+	if request.TLS != nil {
+		proto = "https"
+	}
+	out.Set("X-Forwarded-Proto", proto)
+	out.Set("X-Forwarded-Host", request.Host)
+	out.Add("Via", "1.1 proks")
+	return out
+}
+
+func streamResponse(ctx context.Context, w http.ResponseWriter, src io.Reader) error {
+	flusher, canFlush := w.(http.Flusher)
+	buf := make([]byte, 32*1024)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		n, err := src.Read(buf)
+		if n > 0 {
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				return writeErr
+			}
+			if canFlush {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func appendForwarded(headers http.Header, name, value string) {
+	if value == "" {
+		return
+	}
+	if current := headers.Get(name); current != "" {
+		headers.Set(name, current+", "+value)
+	} else {
+		headers.Set(name, value)
+	}
+}
+
 func (h *Handler) Metrics() *observability.Metrics {
 	return h.metrics
 }
 
-func (h *Handler) registerBookKey(bookID, key string) {
-	if bookID == "" || key == "" {
+func (h *Handler) registerResources(resources []string, key string) {
+	if key == "" {
 		return
 	}
 	h.indexMu.Lock()
 	defer h.indexMu.Unlock()
-
-	if h.bookKeys[bookID] == nil {
-		h.bookKeys[bookID] = make(map[string]struct{})
+	for resourceID := range h.keyResources[key] {
+		delete(h.resourceKeys[resourceID], key)
+		if len(h.resourceKeys[resourceID]) == 0 {
+			delete(h.resourceKeys, resourceID)
+		}
 	}
-	h.bookKeys[bookID][key] = struct{}{}
+	delete(h.keyResources, key)
+	for _, resourceID := range resources {
+		if resourceID == "" {
+			continue
+		}
+		if h.resourceKeys[resourceID] == nil {
+			h.resourceKeys[resourceID] = make(map[string]struct{})
+		}
+		h.resourceKeys[resourceID][key] = struct{}{}
+		if h.keyResources[key] == nil {
+			h.keyResources[key] = make(map[string]struct{})
+		}
+		h.keyResources[key][resourceID] = struct{}{}
+	}
+}
+
+func resourcesForRequest(r *http.Request, headers http.Header) []string {
+	if r == nil {
+		return nil
+	}
+	path := strings.Trim(r.URL.Path, "/")
+	parts := strings.Split(path, "/")
+	var resources []string
+	if len(parts) >= 2 && parts[0] == "books" {
+		resources = append(resources, "book:"+parts[1])
+	} else if len(parts) == 1 && parts[0] == "books" {
+		resources = append(resources, "list:books")
+	}
+	if len(parts) >= 2 && parts[0] == "categories" {
+		resources = append(resources, "category:"+parts[1])
+	}
+	if query := r.URL.Query().Get("q"); query != "" {
+		resources = append(resources, "search:"+strings.ToLower(strings.TrimSpace(query)))
+	}
+	for _, dependency := range strings.Split(headers.Get("X-Cache-Depends-On"), ",") {
+		dependency = strings.TrimSpace(dependency)
+		if strings.HasPrefix(dependency, "book:") || strings.HasPrefix(dependency, "category:") ||
+			strings.HasPrefix(dependency, "list:") || strings.HasPrefix(dependency, "search:") ||
+			strings.HasPrefix(dependency, "aggregate:") {
+			resources = append(resources, dependency)
+		}
+	}
+	return resources
 }
 
 func extractBookIDFromRoute(s string) string {
@@ -637,6 +912,7 @@ func extractBookIDFromRoute(s string) string {
 		if end := strings.IndexAny(rest, "|/"); end != -1 {
 			return rest[:end]
 		}
+
 		return rest
 	}
 	if idx := strings.Index(s, "/books/"); idx != -1 {
@@ -645,6 +921,15 @@ func extractBookIDFromRoute(s string) string {
 			return rest[:end]
 		}
 		return rest
+	}
+	return ""
+}
+
+func cacheKeyBookID(key string) string {
+	for _, part := range strings.Split(key, "|") {
+		if strings.HasPrefix(part, "book_view:") {
+			return strings.TrimPrefix(part, "book_view:")
+		}
 	}
 	return ""
 }
