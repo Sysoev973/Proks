@@ -362,3 +362,47 @@ func TestServeHTTPMetrics(t *testing.T) {
 		t.Fatalf("expected metrics output, got: %s", rr.Body.String())
 	}
 }
+
+func TestEnqueuedPrefetchDoesNotTurnHitIntoPrefetch(t *testing.T) {
+	c := cache.NewInMemoryCache(10, nil)
+	pf := &recordingPrefetcher{}
+	pred := predictor.NewMarkov()
+	pred.Update("book_view:1", "book_view:2")
+
+	h, err := NewHandler(c, pred, pf, "http://example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.trend = nil
+	h.prefetchThreshold = 0.5
+	h.maybePrefetch(context.Background(), "book_view:1")
+	if len(pf.keys) != 1 {
+		t.Fatalf("expected one enqueued prefetch, got %+v", pf.keys)
+	}
+	if h.consumePrefetchSignal(pf.keys[0]) {
+		t.Fatal("enqueue alone must not mark the key as prefetched")
+	}
+
+	h.MarkPrefetched(pf.keys[0])
+	if !h.consumePrefetchSignal(pf.keys[0]) {
+		t.Fatal("expected key to be marked after a successful prefetch")
+	}
+}
+
+func TestMaybePrefetchSkipsDisabledPrefetcher(t *testing.T) {
+	pf := prefetcher.NewAsyncPrefetcher(1, 8, 20*time.Millisecond, nil, nil)
+	defer pf.Stop()
+	pred := predictor.NewMarkov()
+	pred.Update("book_view:1", "book_view:2")
+
+	h, err := NewHandler(cache.NewInMemoryCache(10, nil), pred, pf, "http://example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.trend = nil
+	h.prefetchThreshold = 0.5
+	h.maybePrefetch(context.Background(), "book_view:1")
+	if got := pf.Snapshot().Enqueued; got != 0 {
+		t.Fatalf("disabled prefetcher must not enqueue, got %d", got)
+	}
+}

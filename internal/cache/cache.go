@@ -196,6 +196,19 @@ func (c *InMemoryCache) Snapshot(_ context.Context) Snapshot {
 	return Snapshot{Size: len(c.items), Keys: keys}
 }
 
+// Victim returns the key that would be evicted next (the LRU tail) in O(1).
+func (c *InMemoryCache) Victim() (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	back := c.lru.Back()
+	if back == nil {
+		return "", false
+	}
+	key, ok := back.Value.(string)
+	return key, ok
+}
+
 func (c *InMemoryCache) Admission() AdmissionPolicy {
 	return c.admission
 }

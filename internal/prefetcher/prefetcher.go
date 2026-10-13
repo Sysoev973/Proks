@@ -124,8 +124,14 @@ func NewAsyncPrefetcher(workers, queueSize int, timeout time.Duration, fetch Fet
 	return p
 }
 
+// Enabled reports whether the prefetcher has a loader. Without one, jobs are
+// not queued and no outcomes (successes or failures) are recorded.
+func (p *AsyncPrefetcher) Enabled() bool {
+	return p != nil && p.fetch != nil
+}
+
 func (p *AsyncPrefetcher) Enqueue(ctx context.Context, key string, reason PrefetchReason) {
-	if key == "" {
+	if key == "" || !p.Enabled() {
 		return
 	}
 	p.mu.RLock()
