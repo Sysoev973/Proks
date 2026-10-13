@@ -59,6 +59,8 @@ services:
       EVENT_VERSION_STATE_PATH: "/var/lib/proks/events/state.json"
       EVENT_LOG_PATH: "/var/lib/proks/events/events.log"
       RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+      RABBITMQ_REQUIRED: "true"
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-dev-admin-token}"
     volumes:
       - proxy-events:/var/lib/proks/events
     depends_on:
@@ -101,6 +103,8 @@ services:
     depends_on:
       proxy:
         condition: service_healthy
+    environment:
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-dev-admin-token}"
     volumes:
       - ./k6:/scripts
     entrypoint: ["sh", "-c", "sleep 15; k6 run /scripts/read-heavy.js --vus 10 --duration 30s"]

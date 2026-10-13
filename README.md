@@ -70,7 +70,7 @@ cd C:\(Путь до директории проекта)
 
 - **2.2. Откройте 3 терминала PowerShell.**
 
-- **2.3. Запустите контейнер RabbitMQ:**
+- **2.3. (Опционально) Запустите контейнер RabbitMQ:**
   
 ```powershell
 docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
@@ -81,6 +81,8 @@ docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
 - **3.1. Терминал 1 (Прокси-сервер):**
 
 ```powershell
+$env:RABBITMQ_URL="amqp://guest:guest@localhost:5672/"  # без него используется in-memory брокер
+$env:ADMIN_TOKEN="dev-admin-token"
 $env:PROXY_REPLICA_ID="proxy-local"
 $env:EVENT_VERSION_STATE_PATH="$PWD\data\events\state.json"
 $env:EVENT_LOG_PATH="$PWD\data\events\events.log"
@@ -108,6 +110,18 @@ curl.exe -i http://localhost:8080/health/ready
 ## Политика кэширования
 
 Политика задаётся через `proxy.CachePolicy` и передаётся в `NewHandlerWithPolicy`. По умолчанию кэшируются только успешные `GET`-ответы с TTL 5 минут. Запросы с `Authorization` или `Cookie`, а также ответы с `Set-Cookie`, `Cache-Control: private/no-store` и неподдерживаемым `Vary` обходят кэш и всегда идут в upstream. При явном разрешении персонализированного кэша значения `Authorization` и `Cookie` представлены в ключе только SHA-256 fingerprint, а не исходным секретом.
+
+RabbitMQ опционален. Если `RABBITMQ_URL` не задан, прокси использует in-memory брокер: инвалидация работает только внутри текущей реплики. Если `RABBITMQ_URL` задан, но RabbitMQ недоступен в течение `RABBITMQ_CONNECT_TIMEOUT` (по умолчанию `60s`), прокси пишет предупреждение и тоже переходит на in-memory брокер; чтобы вместо этого завершаться с ошибкой, задайте `RABBITMQ_REQUIRED=true` (так настроен `docker-compose.yml`).
+
+Endpoint `POST /internal/events/book.updated` защищён:
+
+- `ADMIN_TOKEN` — требует заголовок `Authorization: Bearer <token>`;
+- `ADMIN_LISTEN_ADDR` (например, `127.0.0.1:9091`) — endpoint обслуживается только на отдельном admin-порту, а на публичном порту отвечает `404`. Токен при этом тоже проверяется, если задан;
+- если не задано ни то, ни другое, endpoint отключён (`404`).
+
+```powershell
+curl.exe -i -X POST http://localhost:8080/internal/events/book.updated -H "Authorization: Bearer dev-admin-token" -H "Content-Type: application/json" -d '{\"type\":\"book.updated\",\"book_id\":\"1\",\"version\":2}'
+```
 
 Для RabbitMQ каждая реплика использует собственную durable-очередь. Обязательная переменная `PROXY_REPLICA_ID` должна быть стабильной и уникальной для реплики; без неё RabbitMQ-брокер не запускается. Для сохранения deduplication-версий между перезапусками задайте `EVENT_VERSION_STATE_PATH` на постоянный том.
 
@@ -203,7 +217,7 @@ sudo systemctl start docker
 cd /path/to/your/directory
 ```
 
-- **3. Запустите контейнер RabbitMQ:**
+- **3. (Опционально) Запустите контейнер RabbitMQ:**
 
 ```bash
 docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
@@ -216,6 +230,8 @@ docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
 - **4.1. Терминал 1 (Прокси-сервер):**
 
 ```bash
+export RABBITMQ_URL="amqp://guest:guest@localhost:5672/"  # без него используется in-memory брокер
+export ADMIN_TOKEN="dev-admin-token"
 export PROXY_REPLICA_ID="proxy-local"
 export EVENT_VERSION_STATE_PATH="$PWD/data/events/state.json"
 export EVENT_LOG_PATH="$PWD/data/events/events.log"

@@ -18,6 +18,7 @@ export default function () {
   const res = http.post('http://proxy:8080/internal/events/book.updated', payload, {
     headers: {
       'Content-Type': 'application/json',
+      Authorization: `Bearer ${__ENV.ADMIN_TOKEN}`,
     },
   });
   check(res, { 'event accepted': (r) => r.status === 202 });

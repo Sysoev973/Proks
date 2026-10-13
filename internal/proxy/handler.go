@@ -421,7 +421,10 @@ func (h *Handler) recordTrend(key string, success bool) {
 	h.trend.ObservePrefetch(key, success)
 }
 
-func (h *Handler) markPrefetch(key string) {
+// MarkPrefetched records that key was loaded into the cache by a successful
+// prefetch, so the next HIT for it is reported as PREFETCH. Call it only after
+// the prefetch fetch has stored the item.
+func (h *Handler) MarkPrefetched(key string) {
 	if key == "" {
 		return
 	}
@@ -466,14 +469,10 @@ func (h *Handler) computeMetrics(key string) cache.Metrics {
 				metrics.Frequency = float64(freq)
 				metrics.CandidateFrequency = freq
 			}
-			if metrics.CurrentSize > 0 {
-				if snap := c.Snapshot(context.Background()); len(snap.Keys) > 0 {
-					victimKey := snap.Keys[len(snap.Keys)-1]
-					victimFreq := adm.Frequency(victimKey)
-					metrics.VictimKey = victimKey
-					metrics.VictimFrequency = victimFreq
-					metrics.Pollution = adm.PollutantScore(key, victimKey)
-				}
+			if victimKey, ok := c.Victim(); ok {
+				metrics.VictimKey = victimKey
+				metrics.VictimFrequency = adm.Frequency(victimKey)
+				metrics.Pollution = adm.PollutantScore(key, victimKey)
 			}
 		}
 	}
@@ -569,15 +568,17 @@ func (h *Handler) maybePrefetchForRequest(ctx context.Context, r *http.Request, 
 	if h.cacheIsPolluted(prefetchKey) {
 		return
 	}
+	if pf, ok := h.prefetcher.(interface{ Enabled() bool }); ok && !pf.Enabled() {
+		return
+	}
 	prefetchCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
+	// The key is marked as prefetched only by MarkPrefetched, once the load has
+	// actually stored the item; marking at enqueue time would label ordinary
+	// HITs as PREFETCH.
 	h.prefetcher.Enqueue(prefetchCtx, prefetchKey, prefetcher.ReasonMarkov)
 	if h.metrics != nil {
 		h.metrics.RecordPrefetchEnqueued()
-	}
-	h.markPrefetch(prefetchKey)
-	if ctx != nil && ctx.Err() != nil {
-		return
 	}
 }
 
@@ -593,8 +594,7 @@ func (h *Handler) cacheIsPolluted(candidateKey string) bool {
 	if !ok || admission == nil || admission.Filter == nil {
 		return false
 	}
-	if snap := c.Snapshot(context.Background()); len(snap.Keys) > 0 {
-		victimKey := snap.Keys[len(snap.Keys)-1]
+	if victimKey, ok := c.Victim(); ok {
 		if victimKey == candidateKey {
 			return true
 		}

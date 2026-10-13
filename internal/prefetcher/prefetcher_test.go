@@ -62,3 +62,23 @@ func TestAsyncPrefetcherTimeoutIsTrackedAsCanceled(t *testing.T) {
 		t.Fatalf("expected timeout/cancel to be tracked, got canceled=%d", got)
 	}
 }
+
+func TestAsyncPrefetcherWithoutLoaderRecordsNothing(t *testing.T) {
+	p := NewAsyncPrefetcher(1, 8, 20*time.Millisecond, nil, nil)
+	defer p.Stop()
+	var outcomes int64
+	p.SetOutcomeHook(func(string, bool) { atomic.AddInt64(&outcomes, 1) })
+
+	if p.Enabled() {
+		t.Fatal("prefetcher without loader must report disabled")
+	}
+	p.Enqueue(context.Background(), "book_view:40", ReasonMarkov)
+	time.Sleep(30 * time.Millisecond)
+
+	if got := atomic.LoadInt64(&outcomes); got != 0 {
+		t.Fatalf("expected no outcomes, got %d", got)
+	}
+	if snap := p.Snapshot(); snap != (Stats{}) {
+		t.Fatalf("expected zero stats, got %+v", snap)
+	}
+}
