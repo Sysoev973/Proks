@@ -13,6 +13,9 @@ type Metrics struct {
 	hits             prometheus.Counter
 	misses           prometheus.Counter
 	bypasses         prometheus.Counter
+	stale            prometheus.Counter
+	collapsed        prometheus.Counter
+	tooLarge         prometheus.Counter
 	prefetches       prometheus.Counter
 	latency          prometheus.Histogram
 	pollution        prometheus.Gauge
@@ -39,6 +42,18 @@ func NewMetrics() *Metrics {
 		bypasses: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "proxy_cache_bypasses_total",
 			Help: "Total bypassed writes due to admission policy.",
+		}),
+		stale: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "proxy_cache_stale_total",
+			Help: "Total responses served stale (stale-while-revalidate or stale-if-error).",
+		}),
+		tooLarge: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "proxy_cache_too_large_total",
+			Help: "Total cacheable responses not stored because they exceed the per-shard byte budget.",
+		}),
+		collapsed: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "proxy_upstream_collapsed_total",
+			Help: "Total requests that shared another request's in-flight upstream fetch.",
 		}),
 		prefetches: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "proxy_prefetch_total",
@@ -78,7 +93,7 @@ func NewMetrics() *Metrics {
 			Help: "Total prefetch jobs that failed (non-timeout error).",
 		}),
 	}
-	reg.MustRegister(m.hits, m.misses, m.bypasses, m.prefetches, m.latency, m.pollution, m.queueDepth, m.prefetchDropped, m.prefetchCanceled, m.upstreamErrors, m.prefetchExecuted, m.prefetchFailed)
+	reg.MustRegister(m.hits, m.misses, m.bypasses, m.stale, m.collapsed, m.tooLarge, m.prefetches, m.latency, m.pollution, m.queueDepth, m.prefetchDropped, m.prefetchCanceled, m.upstreamErrors, m.prefetchExecuted, m.prefetchFailed)
 	return m
 }
 
@@ -109,6 +124,8 @@ func (m *Metrics) RecordRequest(status string, reason string, d time.Duration) {
 		m.misses.Inc()
 	case "BYPASS":
 		m.bypasses.Inc()
+	case "STALE":
+		m.stale.Inc()
 	}
 	m.latency.Observe(d.Seconds())
 	_ = reason
@@ -140,4 +157,12 @@ func (m *Metrics) RecordUpstreamError(kind string) {
 
 func (m *Metrics) RecordPrefetchEnqueued() {
 	m.prefetches.Inc()
+}
+
+func (m *Metrics) RecordCollapsed() {
+	m.collapsed.Inc()
+}
+
+func (m *Metrics) RecordTooLarge() {
+	m.tooLarge.Inc()
 }

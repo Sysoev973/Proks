@@ -350,3 +350,70 @@ func TestServeHTTPRejectsBodiesOverLimit(t *testing.T) {
 		t.Fatalf("expected oversized upstream response not to be cached, got size %d", c)
 	}
 }
+
+func TestCachePolicyNeverStoresPartialContent(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Header.Get("Range") != "" {
+			w.Header().Set("Content-Range", "bytes 0-3/10")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = io.WriteString(w, "0123")
+			return
+		}
+		_, _ = io.WriteString(w, "0123456789")
+	}))
+	defer upstream.Close()
+
+	h, err := NewHandler(cache.NewInMemoryCache(10, nil), predictor.NewMarkov(), noopPrefetcher{}, upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ranged := httptest.NewRequest(http.MethodGet, "/file", nil)
+	ranged.Header.Set("Range", "bytes=0-3")
+	partial := httptest.NewRecorder()
+	h.ServeHTTP(partial, ranged)
+	if partial.Code != http.StatusPartialContent || partial.Header().Get("X-Cache-Reason") != "RANGE" {
+		t.Fatalf("expected ranged request to bypass, got %d %s", partial.Code, partial.Header().Get("X-Cache-Reason"))
+	}
+
+	full := httptest.NewRecorder()
+	h.ServeHTTP(full, httptest.NewRequest(http.MethodGet, "/file", nil))
+	if full.Body.String() != "0123456789" {
+		t.Fatalf("full request got truncated body %q", full.Body.String())
+	}
+
+	decision, _ := DefaultCachePolicy().responseDecision(httptest.NewRequest(http.MethodGet, "/file", nil), http.StatusPartialContent, http.Header{}, 4)
+	if decision.Allowed || decision.Reason != "PARTIAL" {
+		t.Fatalf("206 must not be cacheable, got %+v", decision)
+	}
+}
+
+func TestChunkedResponseIsBufferedAndCached(t *testing.T) {
+	body := strings.Repeat("x", 5*1024)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, body[:1024])
+		w.(http.Flusher).Flush() // forces chunked transfer encoding
+		_, _ = io.WriteString(w, body[1024:])
+	}))
+	defer upstream.Close()
+
+	h, err := NewHandler(cache.NewInMemoryCache(10, nil), predictor.NewMarkov(), noopPrefetcher{}, upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := httptest.NewRecorder()
+	h.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/books", nil))
+	if first.Code != http.StatusOK || first.Body.String() != body {
+		t.Fatalf("chunked response failed: %d len=%d", first.Code, first.Body.Len())
+	}
+	if first.Header().Get("Content-Length") != "5120" {
+		t.Fatalf("expected buffered Content-Length, got %q", first.Header().Get("Content-Length"))
+	}
+	second := httptest.NewRecorder()
+	h.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/books", nil))
+	if second.Header().Get("X-Cache-Status") != "HIT" || second.Body.String() != body {
+		t.Fatalf("expected cached chunked body, got %s len=%d", second.Header().Get("X-Cache-Status"), second.Body.Len())
+	}
+}

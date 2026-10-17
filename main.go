@@ -29,7 +29,10 @@ func main() {
 	upstream := getenv("UPSTREAM_URL", "http://localhost:8081")
 	addr := getenv("LISTEN_ADDR", ":8080")
 
-	c := cache.NewTinyLFURuntimeCache(10_000)
+	c := cache.NewTinyLFURuntimeCache(
+		int(getenvUint64("CACHE_CAPACITY", 10_000)),
+		int64(getenvUint64("CACHE_MAX_BYTES", 256<<20)),
+	)
 	pred := predictor.NewMarkov()
 
 	alpha := getenvFloat("EWMA_ALPHA", 0.35)
@@ -43,15 +46,17 @@ func main() {
 	}
 	defer closeBroker()
 
-	// Prefetch loading is not implemented yet: with a nil loader the prefetcher
-	// queues nothing and reports no outcomes, so no key is ever marked as
-	// prefetched. A real loader must return nil only after it has stored the
-	// item in the cache.
 	var prefetchLoader prefetcher.FetchFunc
 	pf := prefetcher.NewAsyncPrefetcher(4, 1024, 100*time.Millisecond, prefetchLoader, log.Default())
 	defer pf.Stop()
 
-	h, err := proxy.NewHandler(c, pred, pf, upstream)
+	policy := proxy.DefaultCachePolicy()
+	policy.StaleWhileRevalidate = getenvDuration("CACHE_STALE_WHILE_REVALIDATE", 10*time.Second)
+	policy.StaleIfError = getenvDuration("CACHE_STALE_IF_ERROR", 5*time.Minute)
+	if limit := c.MaxItemBytes(); limit > 0 && limit < policy.MaxBodySize {
+		log.Printf("WARNING: CACHE_MAX_BYTES gives each cache shard %d bytes, so responses larger than that are served but never cached (max body is %d); raise CACHE_MAX_BYTES or lower CACHE_CAPACITY to use fewer shards", limit, policy.MaxBodySize)
+	}
+	h, err := proxy.NewHandlerWithPolicy(c, pred, pf, upstream, policy)
 	if err != nil {
 		log.Fatalf("build handler: %v", err)
 	}
@@ -162,8 +167,6 @@ func newBookUpdatedHandler(stream events.Stream) http.HandlerFunc {
 }
 
 // requireAdminToken rejects requests without "Authorization: Bearer <token>".
-// An empty token disables the check; main only allows that when the handler
-// is served on a separate admin listener.
 func requireAdminToken(token string, next http.Handler) http.Handler {
 	if token == "" {
 		return next
@@ -181,9 +184,6 @@ func requireAdminToken(token string, next http.Handler) http.Handler {
 }
 
 // newEventStream connects to RabbitMQ when RABBITMQ_URL is set and falls back
-// to an in-process broker otherwise. The in-process broker only invalidates
-// this replica's cache. Set RABBITMQ_REQUIRED=true to fail instead of falling
-// back when RabbitMQ is configured but unreachable.
 func newEventStream() (events.Stream, func(), error) {
 	noop := func() {}
 	rabbitmqURL := os.Getenv("RABBITMQ_URL")
@@ -297,6 +297,13 @@ func getenvFloat(key string, fallback float64) float64 {
 	v := os.Getenv(key)
 	if f, err := strconv.ParseFloat(v, 64); err == nil {
 		return f
+	}
+	return fallback
+}
+
+func getenvDuration(key string, fallback time.Duration) time.Duration {
+	if d, err := time.ParseDuration(os.Getenv(key)); err == nil && d >= 0 {
+		return d
 	}
 	return fallback
 }

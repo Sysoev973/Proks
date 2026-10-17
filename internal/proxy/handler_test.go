@@ -216,7 +216,7 @@ func TestServeHTTPTTLExpiry(t *testing.T) {
 func TestBookUpdatedEndpointInvalidatesByVersion(t *testing.T) {
 	c := cache.NewInMemoryCache(32, nil)
 	key := "u|t|ru|book_view:42|"
-	_ = c.Set(context.Background(), cache.Item{Key: key, Value: []byte("old"), StatusCode: http.StatusOK, ExpiresAt: time.Now().Add(time.Minute), Version: 12}, cache.Metrics{})
+	_ = c.Set(context.Background(), cache.Item{Key: key, Value: []byte("old"), StatusCode: http.StatusOK, ExpiresAt: time.Now().Add(time.Minute), Version: 12, Tags: []string{"book:42"}}, cache.Metrics{})
 
 	pf := prefetcher.NewAsyncPrefetcher(1, 8, 20*time.Millisecond, func(ctx context.Context, key string) error { return nil }, nil)
 	defer pf.Stop()

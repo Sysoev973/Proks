@@ -47,12 +47,16 @@ services:
       timeout: 3s
       retries: 12
 
-  proxy:
+  # Every replica needs its own PROXY_REPLICA_ID (its own RabbitMQ queue, so it
+  # receives every invalidation) and its own events volume (state.json and
+  # events.log are per replica). Do not use `--scale proxy=N`: scaled copies
+  # share both and split the invalidations between them.
+  proxy: &proxy
     build: .
     restart: on-failure
     ports:
       - "8080:8080"
-    environment:
+    environment: &proxy-env
       UPSTREAM_URL: "http://upstream:8081"
       LISTEN_ADDR: ":8080"
       PROXY_REPLICA_ID: "proxy-1"
@@ -75,6 +79,16 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
+
+  proxy-2:
+    <<: *proxy
+    ports:
+      - "8082:8080"
+    environment:
+      <<: *proxy-env
+      PROXY_REPLICA_ID: "proxy-2"
+    volumes:
+      - proxy-2-events:/var/lib/proks/events
 
   prometheus:
     image: prom/prometheus:v2.54.1
@@ -112,3 +126,4 @@ services:
 volumes:
   pgdata:
   proxy-events:
+  proxy-2-events:
