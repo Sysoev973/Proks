@@ -342,7 +342,7 @@ func (h *Handler) fetch(ctx context.Context, r *http.Request, key string, cachea
 }
 
 func (h *Handler) revalidate(r *http.Request, key string) {
-	req := r.Clone(context.WithoutCancel(r.Context()))
+	req := r.Clone(withUpstreamKind(context.WithoutCancel(r.Context()), upstreamKindRevalidate))
 	h.inflight.DoChan(key, func() (interface{}, error) {
 		return h.fetchAndStore(req.Context(), req, key, true)
 	})
@@ -364,8 +364,33 @@ func (h *Handler) collapsible(r *http.Request) bool {
 	return true
 }
 
+const (
+	upstreamKindClient     = "client"
+	upstreamKindPrefetch   = "prefetch"
+	upstreamKindRevalidate = "revalidate"
+)
+
+type upstreamKindKey struct{}
+
+// withUpstreamKind labels the upstream requests made under ctx for
+// proxy_upstream_requests_total. A collapsed request is counted once, under
+// the kind of the request that led it.
+func withUpstreamKind(ctx context.Context, kind string) context.Context {
+	return context.WithValue(ctx, upstreamKindKey{}, kind)
+}
+
+func upstreamKindFrom(ctx context.Context) string {
+	if kind, ok := ctx.Value(upstreamKindKey{}).(string); ok {
+		return kind
+	}
+	return upstreamKindClient
+}
+
 func (h *Handler) fetchAndStore(ctx context.Context, r *http.Request, key string, cacheable bool) (fetchResult, error) {
 	token := h.invalidations.begin()
+	if h.metrics != nil {
+		h.metrics.RecordUpstreamRequest(upstreamKindFrom(ctx))
+	}
 	upstream, err := h.fetchUpstream(ctx, r)
 	res := fetchResult{upstreamResponse: upstream}
 	if err != nil || upstream.stream != nil {

@@ -19,6 +19,9 @@ import (
 	"strings"
 	"time"
 
+	"proks/internal/events"
+	"proks/migrations"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -31,6 +34,7 @@ type Book struct {
 	PublicationYear *int32  `json:"publication_year,omitempty"`
 	IsRare          bool    `json:"is_rare"`
 	HasEbook        bool    `json:"has_ebook"`
+	Version         int64   `json:"version"`
 }
 
 type Author struct {
@@ -72,11 +76,32 @@ func main() {
 		log.Fatalf("failed to ping database: %v", err)
 	}
 
-	inv := newInvalidator(os.Getenv("INVALIDATION_URL"), os.Getenv("INVALIDATION_TOKEN"))
-	if inv == nil {
-		log.Println("INVALIDATION_URL is not set; PUT /books/{id} will not invalidate the proxy cache")
+	if _, err := db.Exec(ctx, migrations.BookVersionsOutbox); err != nil {
+		log.Fatalf("failed to apply outbox migration: %v", err)
 	}
-	mux := newUpstreamHandler(db, inv)
+
+	// PUT /books/{id} writes its invalidation to invalidation_outbox in the
+	// same transaction as the update; the relay publishes it to RabbitMQ and
+	// deletes the row only after the broker confirmed it.
+	notify := func() {}
+	if rabbitURL := os.Getenv("RABBITMQ_URL"); rabbitURL != "" {
+		interval := time.Second
+		if v := os.Getenv("OUTBOX_POLL_INTERVAL"); v != "" {
+			d, err := time.ParseDuration(v)
+			if err != nil || d <= 0 {
+				log.Fatalf("OUTBOX_POLL_INTERVAL must be a positive duration, got %q", v)
+			}
+			interval = d
+		}
+		relay := newOutboxRelay(db, func() (eventPublisher, error) {
+			return events.NewRabbitPublisher(rabbitURL)
+		}, interval, log.Default())
+		go relay.Run(ctx)
+		notify = relay.Notify
+	} else {
+		log.Println("RABBITMQ_URL is not set; invalidations stay in invalidation_outbox until a relay with RABBITMQ_URL runs")
+	}
+	mux := newUpstreamHandler(db, notify)
 
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {
@@ -86,7 +111,12 @@ func main() {
 	log.Fatal(http.ListenAndServe(addr, mux))
 }
 
-func newUpstreamHandler(db *pgxpool.Pool, inv *invalidator) http.Handler {
+// newUpstreamHandler builds the HTTP API. afterUpdate is called after a PUT
+// commits, so the outbox relay can publish without waiting for its next poll.
+func newUpstreamHandler(db *pgxpool.Pool, afterUpdate func()) http.Handler {
+	if afterUpdate == nil {
+		afterUpdate = func() {}
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -117,7 +147,7 @@ func newUpstreamHandler(db *pgxpool.Pool, inv *invalidator) http.Handler {
 		if book.GenreID != nil {
 			tags = append(tags, genreTag(*book.GenreID))
 		}
-		writeJSON(w, r, cachePolicy{maxAge: 5 * time.Minute, surrogateKeys: tags}, book)
+		writeJSON(w, r, cachePolicy{maxAge: 5 * time.Minute, surrogateKeys: tags, version: book.Version}, book)
 	})
 
 	mux.HandleFunc("GET /books/{id}/authors", func(w http.ResponseWriter, r *http.Request) {
@@ -161,7 +191,7 @@ func newUpstreamHandler(db *pgxpool.Pool, inv *invalidator) http.Handler {
 			return
 		}
 		rows, err := db.Query(r.Context(),
-			`SELECT book_id, genre_id, title, isbn, publication_year, is_rare, has_ebook
+			`SELECT book_id, genre_id, title, isbn, publication_year, is_rare, has_ebook, version
 			   FROM books
 			  WHERE $1 = 0 OR genre_id = $1
 			  ORDER BY book_id
@@ -233,7 +263,7 @@ func newUpstreamHandler(db *pgxpool.Pool, inv *invalidator) http.Handler {
 		}
 		rows, err := db.Query(r.Context(),
 			// language=PostgreSQL
-			`SELECT book_id, genre_id, title, isbn, publication_year, is_rare, has_ebook
+			`SELECT book_id, genre_id, title, isbn, publication_year, is_rare, has_ebook, version
 			   FROM books
 			  WHERE title ILIKE '%' || $1 || '%'
 			  ORDER BY book_id
@@ -299,6 +329,7 @@ func newUpstreamHandler(db *pgxpool.Pool, inv *invalidator) http.Handler {
 		}
 		var oldGenre *int64
 		var book Book
+		var queued []string
 		err := pgx.BeginFunc(r.Context(), db, func(tx pgx.Tx) error {
 			if err := tx.QueryRow(r.Context(), `SELECT genre_id FROM books WHERE book_id = $1 FOR UPDATE`, id).Scan(&oldGenre); err != nil {
 				return err
@@ -311,15 +342,31 @@ func newUpstreamHandler(db *pgxpool.Pool, inv *invalidator) http.Handler {
 				        publication_year = COALESCE($4, publication_year),
 				        is_rare          = COALESCE($5, is_rare),
 				        has_ebook        = COALESCE($6, has_ebook),
-				        genre_id         = COALESCE($7, genre_id)
+				        genre_id         = COALESCE($7, genre_id),
+				        version          = version + 1
 				  WHERE book_id = $1
-				RETURNING book_id, genre_id, title, isbn, publication_year, is_rare, has_ebook`,
+				RETURNING book_id, genre_id, title, isbn, publication_year, is_rare, has_ebook, version`,
 				id, patch.Title, patch.ISBN, patch.PublicationYear, patch.IsRare, patch.HasEbook, patch.GenreID)
 			if err != nil {
 				return err
 			}
-			book, err = pgx.CollectExactlyOneRow(rows, scanBook)
-			return err
+			if book, err = pgx.CollectExactlyOneRow(rows, scanBook); err != nil {
+				return err
+			}
+			// The book's own tag purges its card, its authors and every list
+			// or search page showing it, and carries the new version so a
+			// late or repeated event cannot drop a newer card. A genre change
+			// also moves the book into lists that did not show it before;
+			// lists have no single version, so that purge is unversioned.
+			queued = []string{bookTag(id)}
+			if err := enqueueInvalidation(r.Context(), tx, []string{bookTag(id)}, book.Version); err != nil {
+				return err
+			}
+			if !sameGenre(oldGenre, book.GenreID) {
+				queued = append(queued, "list:books")
+				return enqueueInvalidation(r.Context(), tx, []string{"list:books"}, 0)
+			}
+			return nil
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
 			http.Error(w, "book not found", http.StatusNotFound)
@@ -330,17 +377,14 @@ func newUpstreamHandler(db *pgxpool.Pool, inv *invalidator) http.Handler {
 			return
 		}
 
-		tags := []string{bookTag(id)}
-		if !sameGenre(oldGenre, book.GenreID) {
-			tags = append(tags, "list:books")
-		}
-		invalidated := inv.purge(r.Context(), tags)
+		afterUpdate()
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Upstream-Book-Version", strconv.FormatInt(book.Version, 10))
 		_ = json.NewEncoder(w).Encode(struct {
-			Book        Book     `json:"book"`
-			Invalidated []string `json:"invalidated"`
-		}{book, invalidated})
+			Book   Book     `json:"book"`
+			Queued []string `json:"queued_invalidations"`
+		}{book, queued})
 	})
 	return mux
 }
@@ -367,6 +411,15 @@ func (p bookPatch) validate() error {
 	return nil
 }
 
+// enqueueInvalidation writes an invalidate event to the outbox inside tx, so
+// it is committed exactly when the change it describes is.
+func enqueueInvalidation(ctx context.Context, tx pgx.Tx, tags []string, version int64) error {
+	_, err := tx.Exec(ctx,
+		// language=PostgreSQL
+		`INSERT INTO invalidation_outbox (tags, version) VALUES ($1, $2)`, tags, version)
+	return err
+}
+
 func sameGenre(a, b *int64) bool {
 	if a == nil || b == nil {
 		return a == b
@@ -376,7 +429,7 @@ func sameGenre(a, b *int64) bool {
 
 func scanBook(row pgx.CollectableRow) (Book, error) {
 	var b Book
-	err := row.Scan(&b.ID, &b.GenreID, &b.Title, &b.ISBN, &b.PublicationYear, &b.IsRare, &b.HasEbook)
+	err := row.Scan(&b.ID, &b.GenreID, &b.Title, &b.ISBN, &b.PublicationYear, &b.IsRare, &b.HasEbook, &b.Version)
 	return b, err
 }
 
@@ -389,7 +442,7 @@ func scanGenre(row pgx.CollectableRow) (Genre, error) {
 func queryBook(ctx context.Context, db *pgxpool.Pool, id int64) (Book, error) {
 	rows, err := db.Query(ctx,
 		// language=PostgreSQL
-		`SELECT book_id, genre_id, title, isbn, publication_year, is_rare, has_ebook
+		`SELECT book_id, genre_id, title, isbn, publication_year, is_rare, has_ebook, version
 		   FROM books
 		  WHERE book_id = $1`, id)
 	if err != nil {
@@ -442,6 +495,9 @@ type cachePolicy struct {
 	private       bool
 	surrogateKeys []string
 	dependsOn     []string
+	// version is sent as X-Upstream-Book-Version for responses that show one
+	// book; the proxy keeps an entry newer than a late invalidation.
+	version int64
 }
 
 // writeJSON writes v with Cache-Control, an ETag and the invalidation tags,
@@ -469,51 +525,12 @@ func writeJSON(w http.ResponseWriter, r *http.Request, p cachePolicy, v any) {
 	if len(p.dependsOn) > 0 {
 		h.Set("X-Cache-Depends-On", strings.Join(p.dependsOn, ", "))
 	}
+	if p.version > 0 {
+		h.Set("X-Upstream-Book-Version", strconv.FormatInt(p.version, 10))
+	}
 	if match := r.Header.Get("If-None-Match"); match != "" && match == etag {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 	_, _ = w.Write(body.Bytes())
-}
-
-// invalidator asks the proxy to purge tags after a write
-// (POST /admin/purge); the proxy fans the purge out to every replica.
-type invalidator struct {
-	url    string
-	token  string
-	client *http.Client
-}
-
-func newInvalidator(url, token string) *invalidator {
-	if url == "" {
-		return nil
-	}
-	return &invalidator{url: url, token: token, client: &http.Client{Timeout: 2 * time.Second}}
-}
-
-func (inv *invalidator) purge(ctx context.Context, tags []string) []string {
-	if inv == nil {
-		return nil
-	}
-	body, _ := json.Marshal(map[string][]string{"tags": tags})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, inv.url, bytes.NewReader(body))
-	if err != nil {
-		log.Printf("invalidation request: %v", err)
-		return nil
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if inv.token != "" {
-		req.Header.Set("Authorization", "Bearer "+inv.token)
-	}
-	resp, err := inv.client.Do(req)
-	if err != nil {
-		log.Printf("invalidation failed for %v: %v", tags, err)
-		return nil
-	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusAccepted {
-		log.Printf("invalidation of %v refused: %s", tags, resp.Status)
-		return nil
-	}
-	return tags
 }

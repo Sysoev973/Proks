@@ -11,6 +11,7 @@ type Metrics struct {
 	registry         *prometheus.Registry
 	mu               sync.Mutex
 	hits             prometheus.Counter
+	prefetchHits     prometheus.Counter
 	misses           prometheus.Counter
 	bypasses         prometheus.Counter
 	stale            prometheus.Counter
@@ -26,6 +27,7 @@ type Metrics struct {
 	prefetchExecuted prometheus.Counter
 	prefetchFailed   prometheus.Counter
 	invalidations    *prometheus.CounterVec
+	upstreamRequests *prometheus.CounterVec
 }
 
 func NewMetrics() *Metrics {
@@ -35,6 +37,10 @@ func NewMetrics() *Metrics {
 		hits: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "proxy_cache_hits_total",
 			Help: "Total cache hits.",
+		}),
+		prefetchHits: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "proxy_cache_prefetch_hits_total",
+			Help: "Total first hits on entries loaded by prefetch (not included in proxy_cache_hits_total).",
 		}),
 		misses: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "proxy_cache_misses_total",
@@ -97,8 +103,12 @@ func NewMetrics() *Metrics {
 			Name: "proxy_invalidations_total",
 			Help: "Total invalidation targets applied, labeled by kind (tag or key).",
 		}, []string{"kind"}),
+		upstreamRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "proxy_upstream_requests_total",
+			Help: "Total requests sent upstream, labeled by kind (client, prefetch or revalidate).",
+		}, []string{"kind"}),
 	}
-	reg.MustRegister(m.hits, m.misses, m.bypasses, m.stale, m.collapsed, m.tooLarge, m.prefetches, m.latency, m.pollution, m.queueDepth, m.prefetchDropped, m.prefetchCanceled, m.upstreamErrors, m.prefetchExecuted, m.prefetchFailed, m.invalidations)
+	reg.MustRegister(m.upstreamRequests, m.prefetchHits, m.hits, m.misses, m.bypasses, m.stale, m.collapsed, m.tooLarge, m.prefetches, m.latency, m.pollution, m.queueDepth, m.prefetchDropped, m.prefetchCanceled, m.upstreamErrors, m.prefetchExecuted, m.prefetchFailed, m.invalidations)
 	return m
 }
 
@@ -125,6 +135,8 @@ func (m *Metrics) RecordRequest(status string, reason string, d time.Duration) {
 	switch status {
 	case "HIT":
 		m.hits.Inc()
+	case "PREFETCH":
+		m.prefetchHits.Inc()
 	case "MISS":
 		m.misses.Inc()
 	case "BYPASS":
@@ -175,4 +187,8 @@ func (m *Metrics) RecordTooLarge() {
 func (m *Metrics) RecordInvalidation(tags, keys int) {
 	m.invalidations.WithLabelValues("tag").Add(float64(tags))
 	m.invalidations.WithLabelValues("key").Add(float64(keys))
+}
+
+func (m *Metrics) RecordUpstreamRequest(kind string) {
+	m.upstreamRequests.WithLabelValues(kind).Inc()
 }

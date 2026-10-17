@@ -2,15 +2,16 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"testing"
+
+	"proks/migrations"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -39,40 +40,14 @@ func TestWriteJSONSetsCacheHeaders(t *testing.T) {
 	if rec.Header().Get("Cache-Control") != "private, no-store" {
 		t.Fatalf("personal responses must be private, got %q", rec.Header().Get("Cache-Control"))
 	}
-}
-
-func TestInvalidatorPostsTagsToProxy(t *testing.T) {
-	var mu sync.Mutex
-	var got map[string][]string
-	var auth string
-	status := http.StatusAccepted
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-		auth = r.Header.Get("Authorization")
-		_ = json.NewDecoder(r.Body).Decode(&got)
-		w.WriteHeader(status)
-	}))
-	defer proxy.Close()
-
-	inv := newInvalidator(proxy.URL+"/admin/purge", "secret")
-	if tags := inv.purge(context.Background(), []string{"book:1", "list:books"}); len(tags) != 2 {
-		t.Fatalf("expected both tags to be accepted, got %v", tags)
-	}
-	if auth != "Bearer secret" || strings.Join(got["tags"], ",") != "book:1,list:books" {
-		t.Fatalf("unexpected purge request: auth=%q body=%v", auth, got)
+	if rec.Header().Get("X-Upstream-Book-Version") != "" {
+		t.Fatal("responses without a version must not send X-Upstream-Book-Version")
 	}
 
-	status = http.StatusUnauthorized
-	if tags := inv.purge(context.Background(), []string{"book:1"}); tags != nil {
-		t.Fatalf("a refused purge must be reported, got %v", tags)
-	}
-	proxy.Close()
-	if tags := inv.purge(context.Background(), []string{"book:1"}); tags != nil {
-		t.Fatalf("an unreachable proxy must be reported, got %v", tags)
-	}
-	if newInvalidator("", "") != nil || (*invalidator)(nil).purge(context.Background(), []string{"a:1"}) != nil {
-		t.Fatal("expected no invalidator without a URL")
+	rec = httptest.NewRecorder()
+	writeJSON(rec, httptest.NewRequest(http.MethodGet, "/books/1", nil), cachePolicy{maxAge: 300e9, version: 7}, map[string]int{"id": 1})
+	if got := rec.Header().Get("X-Upstream-Book-Version"); got != "7" {
+		t.Fatalf("X-Upstream-Book-Version = %q, want 7", got)
 	}
 }
 
@@ -134,6 +109,9 @@ func TestUpstreamAgainstPostgres(t *testing.T) {
 	if err := db.Ping(ctx); err != nil {
 		t.Fatalf("ping PostgreSQL: %v", err)
 	}
+	if _, err := db.Exec(ctx, migrations.BookVersionsOutbox); err != nil {
+		t.Fatalf("apply outbox migration: %v", err)
+	}
 
 	var bookID int64
 	if err := db.QueryRow(ctx, "SELECT book_id FROM books ORDER BY book_id LIMIT 1").Scan(&bookID); err != nil {
@@ -141,15 +119,8 @@ func TestUpstreamAgainstPostgres(t *testing.T) {
 	}
 	id := strconv.FormatInt(bookID, 10)
 
-	var purged []string
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body struct{ Tags []string }
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		purged = body.Tags
-		w.WriteHeader(http.StatusAccepted)
-	}))
-	defer proxy.Close()
-	handler := newUpstreamHandler(db, newInvalidator(proxy.URL, ""))
+	var notified atomic.Int32
+	handler := newUpstreamHandler(db, func() { notified.Add(1) })
 
 	do := func(method, target, body string) *httptest.ResponseRecorder {
 		t.Helper()
@@ -198,16 +169,40 @@ func TestUpstreamAgainstPostgres(t *testing.T) {
 	}
 
 	var title string
-	if err := db.QueryRow(ctx, "SELECT title FROM books WHERE book_id = $1", bookID).Scan(&title); err != nil {
+	var version int64
+	if err := db.QueryRow(ctx, "SELECT title, version FROM books WHERE book_id = $1", bookID).Scan(&title, &version); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = db.Exec(ctx, "UPDATE books SET title = $2 WHERE book_id = $1", bookID, title) })
+	if got := do(http.MethodGet, "/books/"+id, "").Header().Get("X-Upstream-Book-Version"); got != strconv.FormatInt(version, 10) {
+		t.Fatalf("card version header = %q, want %d", got, version)
+	}
+	var lastOutbox int64
+	if err := db.QueryRow(ctx, "SELECT COALESCE(MAX(id), 0) FROM invalidation_outbox").Scan(&lastOutbox); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec(ctx, "UPDATE books SET title = $2 WHERE book_id = $1", bookID, title)
+		_, _ = db.Exec(ctx, "DELETE FROM invalidation_outbox WHERE id > $1", lastOutbox)
+	})
 	rec := do(http.MethodPut, "/books/"+id, `{"title":"Изменённое название"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("PUT status %d: %s", rec.Code, rec.Body.String())
 	}
-	if strings.Join(purged, ",") != "book:"+id {
-		t.Fatalf("expected the write to purge book:%s, got %v", id, purged)
+	if notified.Load() != 1 {
+		t.Fatalf("relay notified %d times, want 1", notified.Load())
+	}
+	if got := rec.Header().Get("X-Upstream-Book-Version"); got != strconv.FormatInt(version+1, 10) {
+		t.Fatalf("PUT version header = %q, want %d", got, version+1)
+	}
+	var tags []string
+	var outboxVersion int64
+	if err := db.QueryRow(ctx,
+		"SELECT tags, version FROM invalidation_outbox WHERE id > $1 ORDER BY id", lastOutbox,
+	).Scan(&tags, &outboxVersion); err != nil {
+		t.Fatalf("the update must write its invalidation to the outbox: %v", err)
+	}
+	if strings.Join(tags, ",") != "book:"+id || outboxVersion != version+1 {
+		t.Fatalf("outbox row = %v v%d, want book:%s v%d", tags, outboxVersion, id, version+1)
 	}
 	body, _ := io.ReadAll(do(http.MethodGet, "/books/"+id, "").Body)
 	if !strings.Contains(string(body), "Изменённое название") {

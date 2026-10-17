@@ -837,26 +837,34 @@ func (b *RabbitBroker) Publish(ctx context.Context, evt Event) error {
 
 func (b *RabbitBroker) publishOnce(ctx context.Context, body []byte) error {
 	b.mu.RLock()
-	ch := b.publisherCh
-	closed := b.publisherClosed
-	channelClosed := b.publisherChannelClosed
-	confirms := b.publisherConfirms
+	pub := publisher{
+		ch:            b.publisherCh,
+		closed:        b.publisherClosed,
+		channelClosed: b.publisherChannelClosed,
+		confirms:      b.publisherConfirms,
+	}
 	timeout := b.confirmTimeout
 	b.mu.RUnlock()
-	if ch == nil || closed == nil || channelClosed == nil || confirms == nil {
+	return pub.publishConfirmed(ctx, body, timeout)
+}
+
+// publishConfirmed publishes body as a persistent invalidate message and
+// waits for the broker's confirm. It returns nil only for an ack.
+func (p publisher) publishConfirmed(ctx context.Context, body []byte, timeout time.Duration) error {
+	if p.ch == nil || p.closed == nil || p.channelClosed == nil || p.confirms == nil {
 		return errors.New("rabbitmq publisher channel unavailable")
 	}
 	if timeout <= 0 {
 		timeout = defaultConfirmTimeout
 	}
 	select {
-	case <-closed:
+	case <-p.closed:
 		return errors.New("rabbitmq publisher connection is closed")
-	case <-channelClosed:
+	case <-p.channelClosed:
 		return errors.New("rabbitmq publisher channel is closed")
 	default:
 	}
-	if err := ch.PublishWithContext(ctx, exchangeName, routingKey, false, false, amqp.Publishing{
+	if err := p.ch.PublishWithContext(ctx, exchangeName, routingKey, false, false, amqp.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
 		Body:         body,
@@ -866,19 +874,28 @@ func (b *RabbitBroker) publishOnce(ctx context.Context, body []byte) error {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
-	case confirmation := <-confirms:
+	case confirmation := <-p.confirms:
 		if !confirmation.Ack {
 			return errors.New("rabbitmq publisher confirm rejected")
 		}
 		return nil
-	case <-closed:
+	case <-p.closed:
 		return errors.New("rabbitmq publisher connection closed before confirm")
-	case <-channelClosed:
+	case <-p.channelClosed:
 		return errors.New("rabbitmq publisher channel closed before confirm")
 	case <-timer.C:
 		return errConfirmTimeout
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+func (p publisher) close() {
+	if p.ch != nil {
+		_ = p.ch.Close()
+	}
+	if p.conn != nil {
+		_ = p.conn.Close()
 	}
 }
 
@@ -938,5 +955,80 @@ func (b *RabbitBroker) Close() {
 	}
 	if conn != nil {
 		_ = conn.Close()
+	}
+}
+
+// === RabbitPublisher ===
+
+// RabbitPublisher publishes invalidation events without consuming them. It is
+// for services that only produce events, such as the demo upstream's outbox
+// relay; unlike RabbitBroker it needs no replica ID, queue or event log.
+//
+// Publish returns nil only after the broker confirmed the message. After any
+// failure the channel is closed and the next Publish opens a new one, so a
+// confirm that arrives late is never counted for a later message. Publish
+// does not retry: the caller (the outbox) keeps the event and tries again.
+type RabbitPublisher struct {
+	mu             sync.Mutex
+	dial           dialFunc
+	amqpURL        string
+	pub            *publisher
+	confirmTimeout time.Duration
+}
+
+func NewRabbitPublisher(amqpURL string) (*RabbitPublisher, error) {
+	return newRabbitPublisher(amqpURL, dialAMQP)
+}
+
+func newRabbitPublisher(amqpURL string, dial dialFunc) (*RabbitPublisher, error) {
+	p := &RabbitPublisher{dial: dial, amqpURL: amqpURL, confirmTimeout: defaultConfirmTimeout}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.openLocked(); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+func (p *RabbitPublisher) openLocked() error {
+	pub, err := openPublisher(p.dial, p.amqpURL)
+	if err != nil {
+		return err
+	}
+	p.pub = &pub
+	return nil
+}
+
+func (p *RabbitPublisher) Publish(ctx context.Context, evt Event) error {
+	ensureEventID(&evt)
+	evt, err := Normalize(evt)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(evt)
+	if err != nil {
+		return fmt.Errorf("marshal event: %w", err)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pub == nil {
+		if err := p.openLocked(); err != nil {
+			return err
+		}
+	}
+	if err := p.pub.publishConfirmed(ctx, body, p.confirmTimeout); err != nil {
+		p.pub.close()
+		p.pub = nil
+		return err
+	}
+	return nil
+}
+
+func (p *RabbitPublisher) Close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pub != nil {
+		p.pub.close()
+		p.pub = nil
 	}
 }

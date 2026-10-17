@@ -103,3 +103,25 @@ func TestMetricsValues(t *testing.T) {
 		t.Errorf("key invalidations = %v, want 1", got)
 	}
 }
+
+func TestPrefetchHitsAndUpstreamKindsAreCountedSeparately(t *testing.T) {
+	m := NewMetrics()
+	m.RecordRequest("HIT", "LRU", time.Millisecond)
+	m.RecordRequest("PREFETCH", "MARKOV", time.Millisecond)
+	m.RecordUpstreamRequest("client")
+	m.RecordUpstreamRequest("prefetch")
+	m.RecordUpstreamRequest("prefetch")
+
+	if got := counter(t, m, "proxy_cache_hits_total"); got != 1 {
+		t.Fatalf("hits = %v, want 1 (a prefetch hit is counted on its own)", got)
+	}
+	if got := counter(t, m, "proxy_cache_prefetch_hits_total"); got != 1 {
+		t.Fatalf("prefetch hits = %v, want 1", got)
+	}
+	if got := counter(t, m, "proxy_upstream_requests_total", "kind", "prefetch"); got != 2 {
+		t.Fatalf("prefetch upstream requests = %v, want 2", got)
+	}
+	if got := counter(t, m, "proxy_upstream_requests_total", "kind", "client"); got != 1 {
+		t.Fatalf("client upstream requests = %v, want 1", got)
+	}
+}

@@ -163,6 +163,9 @@ func TestStaleWhileRevalidateServesStaleAndRefreshesOnce(t *testing.T) {
 	if rec.Body.String() != "new" || rec.Header().Get("X-Cache-Status") != "HIT" {
 		t.Fatalf("expected refreshed HIT, got %s %q", rec.Header().Get("X-Cache-Status"), rec.Body.String())
 	}
+	if got := labeledCounter(t, h.MetricsRegistry(), "proxy_upstream_requests_total", "kind", "revalidate"); got != 1 {
+		t.Fatalf("revalidate upstream requests = %v, want 1", got)
+	}
 }
 
 func TestStaleIfErrorFallsBackOnUpstreamFailure(t *testing.T) {

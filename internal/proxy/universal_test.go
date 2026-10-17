@@ -368,6 +368,38 @@ func TestPrefetchServesPredictedRoute(t *testing.T) {
 	if got := cacheStatus(get(t, h, "/b", "X-Tenant", "acme")); got != "HIT" {
 		t.Fatalf("the PREFETCH label must be used once, got %s", got)
 	}
+	reg := h.MetricsRegistry()
+	if got := counterValue(t, reg, "proxy_cache_prefetch_hits_total"); got != 1 {
+		t.Fatalf("proxy_cache_prefetch_hits_total = %v, want 1", got)
+	}
+	if got := labeledCounter(t, reg, "proxy_upstream_requests_total", "kind", "prefetch"); got != 1 {
+		t.Fatalf("prefetch upstream requests = %v, want 1", got)
+	}
+	if got := labeledCounter(t, reg, "proxy_upstream_requests_total", "kind", "client"); got != float64(before) {
+		t.Fatalf("client upstream requests = %v, want %d", got, before)
+	}
+}
+
+func labeledCounter(t *testing.T, reg *prometheus.Registry, name, label, value string) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var total float64
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, m := range family.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == label && lp.GetValue() == value {
+					total += m.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	return total
 }
 
 func TestPrefetchSkipsPersonalRequests(t *testing.T) {
