@@ -23,6 +23,7 @@ import (
 	"proks/internal/prefetcher"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/singleflight"
 )
 
 const maxRequestBodySize = 10 * 1024 * 1024
@@ -47,9 +48,8 @@ func isStreamingResponse(resp *http.Response) bool {
 	if resp == nil {
 		return false
 	}
-	if resp.ContentLength < 0 || len(resp.TransferEncoding) > 0 {
-		return true
-	}
+	// Chunked bodies of unknown length are ordinary responses (net/http chunks
+	// anything over ~2KB); they are buffered under MaxBodySize like the rest.
 	return strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
 }
 
@@ -66,9 +66,8 @@ type Handler struct {
 	eventStream       events.Stream
 	metrics           *observability.Metrics
 	policy            CachePolicy
-	indexMu           sync.RWMutex
-	resourceKeys      map[string]map[string]struct{}
-	keyResources      map[string]map[string]struct{}
+	inflight          singleflight.Group
+	invalidations     *invalidationTracker
 }
 
 type upstreamResponse struct {
@@ -97,8 +96,7 @@ func NewHandlerWithPolicy(cache cache.Cache, pred predictor.Predictor, pf prefet
 		prefetched:        make(map[string]time.Time),
 		metrics:           observability.NewMetrics(),
 		policy:            policy.normalized(),
-		resourceKeys:      make(map[string]map[string]struct{}),
-		keyResources:      make(map[string]map[string]struct{}),
+		invalidations:     newInvalidationTracker(),
 		httpClient: &http.Client{
 			Timeout: 2 * time.Second,
 			Transport: &http.Transport{
@@ -109,22 +107,7 @@ func NewHandlerWithPolicy(cache cache.Cache, pred predictor.Predictor, pf prefet
 			},
 		},
 	}
-	if evicting, ok := cache.(interface{ SetEvictionCallback(func(string)) }); ok {
-		evicting.SetEvictionCallback(h.removeIndexedKey)
-	}
 	return h, nil
-}
-
-func (h *Handler) removeIndexedKey(key string) {
-	h.indexMu.Lock()
-	defer h.indexMu.Unlock()
-	for resourceID := range h.keyResources[key] {
-		delete(h.resourceKeys[resourceID], key)
-		if len(h.resourceKeys[resourceID]) == 0 {
-			delete(h.resourceKeys, resourceID)
-		}
-	}
-	delete(h.keyResources, key)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -138,6 +121,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(w, "cache_size %d\n", h.cache.Size())
 		_, _ = fmt.Fprintf(w, "# HELP cache_capacity Max cache capacity\n")
 		_, _ = fmt.Fprintf(w, "cache_capacity %d\n", h.cache.Capacity())
+		_, _ = fmt.Fprintf(w, "# HELP cache_bytes Approximate bytes held by cache entries\n")
+		_, _ = fmt.Fprintf(w, "cache_bytes %d\n", h.cache.Bytes())
 		return
 	}
 	ctx := r.Context()
@@ -162,46 +147,58 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		)
 	}()
 
+	var staleItem *cache.Item
 	if decision.Allowed {
-		if item, err := h.cache.Get(ctx, key); err == nil {
+		if item, fresh, err := h.cache.Lookup(ctx, key); err == nil {
 			h.recordAccess(key)
 			current := normalizeRouteKey(r)
 			h.recordTransition(r, current)
-			if h.consumePrefetchSignal(key) {
-				h.recordTrend(key, true)
-				status = string(cache.StatusPrefetch)
-				reason = string(cache.ReasonMarkov)
-			} else {
-				status = string(cache.StatusHit)
-				reason = string(cache.ReasonLRU)
+			if fresh {
+				if h.consumePrefetchSignal(key) {
+					h.recordTrend(key, true)
+					status = string(cache.StatusPrefetch)
+					reason = string(cache.ReasonMarkov)
+				} else {
+					status = string(cache.StatusHit)
+					reason = string(cache.ReasonLRU)
+				}
+				writeCachedItem(w, item, status, reason)
+				h.maybePrefetchForRequest(ctx, r, current)
+				return
 			}
-
-			if item.Headers != nil {
-				copyHeaders(w.Header(), item.Headers)
+			swr, sie := h.policy.staleWindows(item.Headers)
+			now := time.Now()
+			if now.Before(item.ExpiresAt.Add(swr)) {
+				h.revalidate(r, key)
+				status = string(cache.StatusStale)
+				reason = "REVALIDATING"
+				writeCachedItem(w, item, status, reason)
+				return
 			}
-			setBufferedContentLength(w.Header(), len(item.Value))
-			w.Header().Set("X-Cache-Status", status)
-			w.Header().Set("X-Cache-Reason", reason)
-			statusCode := item.StatusCode
-			if statusCode == 0 {
-				statusCode = http.StatusOK
+			if now.Before(item.ExpiresAt.Add(sie)) {
+				staleItem = &item
 			}
-			w.WriteHeader(statusCode)
-			_, _ = w.Write(item.Value)
-			h.maybePrefetchForRequest(ctx, r, current)
-			return
 		}
 	}
 
-	upstream, err := h.fetchUpstream(ctx, r)
-	if err != nil {
-		if h.metrics != nil {
-			kind := "other"
-			if errors.Is(err, context.DeadlineExceeded) {
-				kind = "timeout"
-			}
-			h.metrics.RecordUpstreamError(kind)
+	upstream, follower, err := h.fetch(ctx, r, key, decision.Allowed)
+	if follower && h.metrics != nil {
+		h.metrics.RecordCollapsed()
+	}
+	if err != nil && h.metrics != nil {
+		kind := "other"
+		if errors.Is(err, context.DeadlineExceeded) {
+			kind = "timeout"
 		}
+		h.metrics.RecordUpstreamError(kind)
+	}
+	if staleItem != nil && (err != nil || upstream.status >= http.StatusInternalServerError) {
+		status = string(cache.StatusStale)
+		reason = "STALE_IF_ERROR"
+		writeCachedItem(w, *staleItem, status, reason)
+		return
+	}
+	if err != nil {
 		if errors.Is(err, errRequestBodyTooLarge) {
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			status = string(cache.StatusBypass)
@@ -245,45 +242,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respBytes, code, hdr := upstream.body, upstream.status, upstream.headers
-	responseDecision, ttl := h.policy.responseDecision(r, code, hdr, len(respBytes))
-	stored := false
-	var metrics cache.Metrics
-	if decision.Allowed && responseDecision.Allowed {
-		metrics = h.computeMetrics(key)
-		h.recordAccess(key)
-		stored = h.cache.Set(ctx, cache.Item{
-			Key:        key,
-			Value:      respBytes,
-			Headers:    hdr,
-			StatusCode: code,
-			ExpiresAt:  time.Now().Add(ttl),
-			Version:    versionFromResponse(hdr),
-		}, metrics)
-	}
-	if stored {
-		h.registerResources(resourcesForRequest(r, hdr), key)
-	}
 	if h.metrics != nil {
-		h.metrics.RecordPollution(metrics.Pollution)
+		h.metrics.RecordPollution(upstream.pollution)
 	}
 
 	copyHeaders(w.Header(), hdr)
 	setBufferedContentLength(w.Header(), len(respBytes))
-	if stored {
+	if upstream.stored {
 		status = string(cache.StatusMiss)
 		reason = string(cache.ReasonLRU)
-		w.Header().Set("X-Cache-Status", status)
-		w.Header().Set("X-Cache-Reason", reason)
+		if follower {
+			reason = "COLLAPSED"
+		}
 	} else {
 		status = string(cache.StatusBypass)
 		if !decision.Allowed {
 			reason = decision.Reason
 		} else {
-			reason = responseDecision.Reason
+			reason = upstream.decision.Reason
 		}
-		w.Header().Set("X-Cache-Status", status)
-		w.Header().Set("X-Cache-Reason", reason)
 	}
+	w.Header().Set("X-Cache-Status", status)
+	w.Header().Set("X-Cache-Reason", reason)
 
 	w.WriteHeader(code)
 	_, _ = w.Write(respBytes)
@@ -295,6 +275,125 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func writeCachedItem(w http.ResponseWriter, item cache.Item, status, reason string) {
+	if item.Headers != nil {
+		copyHeaders(w.Header(), item.Headers)
+	}
+	setBufferedContentLength(w.Header(), len(item.Value))
+	w.Header().Set("X-Cache-Status", status)
+	w.Header().Set("X-Cache-Reason", reason)
+	statusCode := item.StatusCode
+	if statusCode == 0 {
+		statusCode = http.StatusOK
+	}
+	w.WriteHeader(statusCode)
+	_, _ = w.Write(item.Value)
+}
+
+// the cache. Collapsed requests share one fetchResult, so it is read-only.
+type fetchResult struct {
+	upstreamResponse
+	decision  cacheDecision
+	stored    bool
+	pollution float64
+}
+
+// client that disconnects does not fail the others.
+func (h *Handler) fetch(ctx context.Context, r *http.Request, key string, cacheable bool) (res fetchResult, follower bool, err error) {
+	if !cacheable || !h.collapsible(r) {
+		res, err = h.fetchAndStore(ctx, r, key, cacheable)
+		return res, false, err
+	}
+	ran := false
+	ch := h.inflight.DoChan(key, func() (interface{}, error) {
+		ran = true
+		return h.fetchAndStore(context.WithoutCancel(ctx), r, key, true)
+	})
+	select {
+	case <-ctx.Done():
+		return fetchResult{}, false, ctx.Err()
+	case out := <-ch:
+		res, _ = out.Val.(fetchResult)
+		if ran || out.Err != nil || res.stored {
+			return res, !ran, out.Err
+		}
+		// The leader's response was not cacheable (Set-Cookie, private,
+		// no-store, ...), so it may be personal to the leader's client. Like
+		// Varnish's hit-for-miss, the follower fetches its own response.
+		res, err = h.fetchAndStore(ctx, r, key, false)
+		return res, false, err
+	}
+}
+
+func (h *Handler) revalidate(r *http.Request, key string) {
+	req := r.Clone(context.WithoutCancel(r.Context()))
+	h.inflight.DoChan(key, func() (interface{}, error) {
+		return h.fetchAndStore(req.Context(), req, key, true)
+	})
+}
+
+// makes its response differ from the cached one.
+func (h *Handler) collapsible(r *http.Request) bool {
+	if h.policy.AllowStreaming {
+		return false
+	}
+	if r.Body != nil && r.Body != http.NoBody {
+		return false
+	}
+	for _, name := range []string{"If-None-Match", "If-Modified-Since", "If-Match", "If-Unmodified-Since", "If-Range"} {
+		if r.Header.Get(name) != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func (h *Handler) fetchAndStore(ctx context.Context, r *http.Request, key string, cacheable bool) (fetchResult, error) {
+	token := h.invalidations.begin()
+	upstream, err := h.fetchUpstream(ctx, r)
+	res := fetchResult{upstreamResponse: upstream}
+	if err != nil || upstream.stream != nil {
+		return res, err
+	}
+	var ttl time.Duration
+	res.decision, ttl = h.policy.responseDecision(r, upstream.status, upstream.headers, len(upstream.body))
+	if !cacheable || !res.decision.Allowed {
+		return res, nil
+	}
+	expiresAt := time.Now().Add(ttl)
+	swr, sie := h.policy.staleWindows(upstream.headers)
+	item := cache.Item{
+		Key:        key,
+		Value:      upstream.body,
+		Headers:    upstream.headers,
+		StatusCode: upstream.status,
+		ExpiresAt:  expiresAt,
+		StaleUntil: expiresAt.Add(max(swr, sie)),
+		Version:    versionFromResponse(upstream.headers),
+		Tags:       resourcesForRequest(r, upstream.headers),
+	}
+	if limited, ok := h.cache.(interface{ MaxItemBytes() int64 }); ok {
+		if limit := limited.MaxItemBytes(); limit > 0 && cache.ItemSize(item) > limit {
+			res.decision = cacheDecision{Reason: "TOO_LARGE"}
+			if h.metrics != nil {
+				h.metrics.RecordTooLarge()
+			}
+			return res, nil
+		}
+	}
+	metrics := h.computeMetrics(key)
+	h.recordAccess(key)
+	var invalidated bool
+	res.stored, invalidated = h.invalidations.storeIfCurrent(token, item.Tags, item.Version, func() bool {
+		return h.cache.Set(ctx, item, metrics)
+	})
+	if invalidated {
+		res.decision = cacheDecision{Reason: "INVALIDATED"}
+	}
+	res.pollution = metrics.Pollution
+	return res, nil
+}
+
 func (h *Handler) InvalidateBook(ctx context.Context, key string) {
 	if key == "" || h.cache == nil {
 		return
@@ -303,44 +402,15 @@ func (h *Handler) InvalidateBook(ctx context.Context, key string) {
 }
 
 func (h *Handler) invalidateResource(ctx context.Context, resourceID string, version int64) {
-	h.indexMu.Lock()
-	keys := make(map[string]struct{})
-	indexedResources := make([]string, 0)
-	for id, indexedKeys := range h.resourceKeys {
-		if id == resourceID {
-			indexedResources = append(indexedResources, id)
-			for key := range indexedKeys {
-				keys[key] = struct{}{}
-			}
-		}
-	}
-	h.indexMu.Unlock()
-	if len(keys) == 0 {
-		for _, key := range h.cache.Snapshot(ctx).Keys {
-			if cacheKeyBookID(key) == strings.TrimPrefix(resourceID, "book:") {
-				keys[key] = struct{}{}
-			}
-		}
-	}
-	deleted := make(map[string]struct{})
-	for key := range keys {
-		item, err := h.cache.Get(ctx, key)
+	// Recorded before the purge so that fetches already in flight do not
+	// store what they read before it.
+	h.invalidations.invalidate(resourceID, version)
+	for _, key := range h.cache.KeysForTag(ctx, resourceID) {
+		item, _, err := h.cache.Lookup(ctx, key)
 		if err != nil || version == 0 || item.Version == 0 || item.Version <= version {
 			h.cache.Delete(ctx, key)
-			deleted[key] = struct{}{}
 		}
 	}
-	h.indexMu.Lock()
-	for _, resource := range indexedResources {
-		for key := range deleted {
-			delete(h.resourceKeys[resource], key)
-			delete(h.keyResources, key)
-		}
-		if len(h.resourceKeys[resource]) == 0 {
-			delete(h.resourceKeys, resource)
-		}
-	}
-	h.indexMu.Unlock()
 }
 
 func requestIDFromContext(ctx context.Context) string {
@@ -433,8 +503,21 @@ func (h *Handler) MarkPrefetched(key string) {
 	if h.prefetched == nil {
 		h.prefetched = make(map[string]time.Time)
 	}
+	// Prefetched keys that are never hit would otherwise stay forever.
+	if len(h.prefetched) >= maxPrefetchSignals {
+		for k, seen := range h.prefetched {
+			if time.Since(seen) > prefetchSignalTTL {
+				delete(h.prefetched, k)
+			}
+		}
+	}
 	h.prefetched[key] = time.Now()
 }
+
+const (
+	prefetchSignalTTL  = 5 * time.Minute
+	maxPrefetchSignals = 1024
+)
 
 func (h *Handler) consumePrefetchSignal(key string) bool {
 	if key == "" {
@@ -450,7 +533,7 @@ func (h *Handler) consumePrefetchSignal(key string) bool {
 		return false
 	}
 	delete(h.prefetched, key)
-	return time.Since(seen) <= 5*time.Minute
+	return time.Since(seen) <= prefetchSignalTTL
 }
 
 func (h *Handler) computeMetrics(key string) cache.Metrics {
@@ -469,7 +552,7 @@ func (h *Handler) computeMetrics(key string) cache.Metrics {
 				metrics.Frequency = float64(freq)
 				metrics.CandidateFrequency = freq
 			}
-			if victimKey, ok := c.Victim(); ok {
+			if victimKey, ok := c.VictimFor(key); ok {
 				metrics.VictimKey = victimKey
 				metrics.VictimFrequency = adm.Frequency(victimKey)
 				metrics.Pollution = adm.PollutantScore(key, victimKey)
@@ -594,7 +677,7 @@ func (h *Handler) cacheIsPolluted(candidateKey string) bool {
 	if !ok || admission == nil || admission.Filter == nil {
 		return false
 	}
-	if victimKey, ok := c.Victim(); ok {
+	if victimKey, ok := c.VictimFor(candidateKey); ok {
 		if victimKey == candidateKey {
 			return true
 		}
@@ -849,34 +932,6 @@ func (h *Handler) Metrics() *observability.Metrics {
 	return h.metrics
 }
 
-func (h *Handler) registerResources(resources []string, key string) {
-	if key == "" {
-		return
-	}
-	h.indexMu.Lock()
-	defer h.indexMu.Unlock()
-	for resourceID := range h.keyResources[key] {
-		delete(h.resourceKeys[resourceID], key)
-		if len(h.resourceKeys[resourceID]) == 0 {
-			delete(h.resourceKeys, resourceID)
-		}
-	}
-	delete(h.keyResources, key)
-	for _, resourceID := range resources {
-		if resourceID == "" {
-			continue
-		}
-		if h.resourceKeys[resourceID] == nil {
-			h.resourceKeys[resourceID] = make(map[string]struct{})
-		}
-		h.resourceKeys[resourceID][key] = struct{}{}
-		if h.keyResources[key] == nil {
-			h.keyResources[key] = make(map[string]struct{})
-		}
-		h.keyResources[key][resourceID] = struct{}{}
-	}
-}
-
 func resourcesForRequest(r *http.Request, headers http.Header) []string {
 	if r == nil {
 		return nil
@@ -921,15 +976,6 @@ func extractBookIDFromRoute(s string) string {
 			return rest[:end]
 		}
 		return rest
-	}
-	return ""
-}
-
-func cacheKeyBookID(key string) string {
-	for _, part := range strings.Split(key, "|") {
-		if strings.HasPrefix(part, "book_view:") {
-			return strings.TrimPrefix(part, "book_view:")
-		}
 	}
 	return ""
 }

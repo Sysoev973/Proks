@@ -16,6 +16,8 @@ type CachePolicy struct {
 	SuccessTTL            time.Duration
 	ErrorTTL              time.Duration
 	RespectResponseTTL    bool
+	StaleWhileRevalidate  time.Duration
+	StaleIfError          time.Duration
 	CacheErrors           bool
 	VaryHeaders           []string
 	Dimensions            []string
@@ -73,6 +75,12 @@ func (p CachePolicy) normalized() CachePolicy {
 	if p.MaxBodySize <= 0 {
 		p.MaxBodySize = maxRequestBodySize
 	}
+	if p.StaleWhileRevalidate < 0 {
+		p.StaleWhileRevalidate = 0
+	}
+	if p.StaleIfError < 0 {
+		p.StaleIfError = 0
+	}
 	return p
 }
 
@@ -83,6 +91,9 @@ func (p CachePolicy) requestDecision(r *http.Request) cacheDecision {
 	}
 	if hasNoStoreOrPrivate(r.Header.Get("Cache-Control")) {
 		return cacheDecision{Reason: "REQUEST_CACHE_CONTROL"}
+	}
+	if r.Header.Get("Range") != "" {
+		return cacheDecision{Reason: "RANGE"}
 	}
 	if r.Header.Get("Authorization") != "" && !p.AllowAuthorization {
 		return cacheDecision{Reason: "AUTHORIZATION"}
@@ -97,6 +108,10 @@ func (p CachePolicy) responseDecision(r *http.Request, status int, headers http.
 	p = p.normalized()
 	if bodySize > int(p.MaxBodySize) {
 		return cacheDecision{Reason: "BODY_SIZE"}, 0
+	}
+	// A partial body must never be stored under the key of the full resource.
+	if status == http.StatusPartialContent || headers.Get("Content-Range") != "" {
+		return cacheDecision{Reason: "PARTIAL"}, 0
 	}
 	if !statusAllowed(status, p.AllowedStatus) {
 		return cacheDecision{Reason: "STATUS"}, 0
@@ -135,6 +150,31 @@ func (p CachePolicy) responseDecision(r *http.Request, status int, headers http.
 		}
 	}
 	return cacheDecision{Allowed: true}, ttl
+}
+
+func (p CachePolicy) staleWindows(headers http.Header) (swr, sie time.Duration) {
+	swr, sie = p.StaleWhileRevalidate, p.StaleIfError
+	for _, directive := range strings.Split(strings.ToLower(headers.Get("Cache-Control")), ",") {
+		parts := strings.SplitN(strings.TrimSpace(directive), "=", 2)
+		name := strings.TrimSpace(parts[0])
+		if name == "must-revalidate" || name == "proxy-revalidate" {
+			return 0, 0
+		}
+		if len(parts) != 2 {
+			continue
+		}
+		seconds, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+		if err != nil || seconds < 0 {
+			continue
+		}
+		switch name {
+		case "stale-while-revalidate":
+			swr = time.Duration(seconds) * time.Second
+		case "stale-if-error":
+			sie = time.Duration(seconds) * time.Second
+		}
+	}
+	return swr, sie
 }
 
 func statusAllowed(status int, ranges []StatusRange) bool {

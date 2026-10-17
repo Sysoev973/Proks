@@ -147,10 +147,35 @@ type RabbitBroker struct {
 	queueName              string
 	statePath              string
 	eventLogPath           string
+	queueTTL               time.Duration
 	handler                Handler
 	mu                     sync.RWMutex
 	maxVersion             map[string]int64
 	processed              map[string]struct{}
+	processedOrder         []string
+	logMu                  sync.Mutex
+	appendedSinceCompact   int
+}
+
+// maxProcessedEvents bounds the remembered event IDs. Forgetting an old ID is
+// safe: versioned events are still ordered by maxVersion, and re-applying an
+// unversioned invalidation only drops cache entries again.
+const maxProcessedEvents = 10_000
+
+// rememberLocked records eventID as processed, forgetting the oldest IDs
+// beyond maxProcessedEvents.
+func (b *RabbitBroker) rememberLocked(eventID string) {
+	if _, ok := b.processed[eventID]; ok {
+		return
+	}
+	b.processed[eventID] = struct{}{}
+	b.processedOrder = append(b.processedOrder, eventID)
+	if over := len(b.processedOrder) - maxProcessedEvents; over > 0 {
+		for _, old := range b.processedOrder[:over] {
+			delete(b.processed, old)
+		}
+		b.processedOrder = append([]string(nil), b.processedOrder[over:]...)
+	}
 }
 
 type persistedState struct {
@@ -173,7 +198,7 @@ func (b *RabbitBroker) loadVersions() error {
 	if json.Unmarshal(data, &state) == nil && state.Versions != nil {
 		b.maxVersion = state.Versions
 		for _, eventID := range state.Processed {
-			b.processed[eventID] = struct{}{}
+			b.rememberLocked(eventID)
 		}
 		return nil
 	}
@@ -192,11 +217,7 @@ func (b *RabbitBroker) persistVersionsLocked() error {
 			return err
 		}
 	}
-	processed := make([]string, 0, len(b.processed))
-	for eventID := range b.processed {
-		processed = append(processed, eventID)
-	}
-	data, err := json.Marshal(persistedState{Versions: b.maxVersion, Processed: processed})
+	data, err := json.Marshal(persistedState{Versions: b.maxVersion, Processed: b.processedOrder})
 	if err != nil {
 		return err
 	}
@@ -235,10 +256,58 @@ func (b *RabbitBroker) loadEventLog() ([]BookUpdateEvent, error) {
 	return result, nil
 }
 
+// eventLogCompactEvery is how many appended events trigger a compaction.
+const eventLogCompactEvery = 1000
+
+// alreadyApplied reports whether replaying evt would be a no-op.
+func (b *RabbitBroker) alreadyApplied(evt BookUpdateEvent) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if _, ok := b.processed[evt.EventID]; ok {
+		return true
+	}
+	return evt.Version > 0 && evt.Version <= b.maxVersion[evt.BookID]
+}
+
+// compactEventLogLocked rewrites the event log keeping only events that have
+// not been applied yet, so the log stays small and startup replays only what
+// is still pending. b.logMu must be held.
+func (b *RabbitBroker) compactEventLogLocked() error {
+	if b.eventLogPath == "" {
+		return nil
+	}
+	logged, err := b.loadEventLog()
+	if err != nil {
+		return err
+	}
+	var buf []byte
+	for _, evt := range logged {
+		if b.alreadyApplied(evt) {
+			continue
+		}
+		data, err := json.Marshal(evt)
+		if err != nil {
+			return err
+		}
+		buf = append(append(buf, data...), '\n')
+	}
+	tmp := b.eventLogPath + ".tmp"
+	if err := os.WriteFile(tmp, buf, 0o640); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, b.eventLogPath); err != nil {
+		return err
+	}
+	b.appendedSinceCompact = 0
+	return nil
+}
+
 func (b *RabbitBroker) appendEvent(evt BookUpdateEvent) error {
 	if b.eventLogPath == "" {
 		return nil
 	}
+	b.logMu.Lock()
+	defer b.logMu.Unlock()
 	if dir := filepath.Dir(b.eventLogPath); dir != "." {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			return err
@@ -252,17 +321,30 @@ func (b *RabbitBroker) appendEvent(evt BookUpdateEvent) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-	if _, err := file.Write(append(data, '\n')); err != nil {
+	_, err = file.Write(append(data, '\n'))
+	if err == nil {
+		err = file.Sync()
+	}
+	// Closed before compaction: the log cannot be replaced while open on Windows.
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
 		return err
 	}
-	return file.Sync()
+	b.appendedSinceCompact++
+	if b.appendedSinceCompact >= eventLogCompactEvery {
+		if err := b.compactEventLogLocked(); err != nil {
+			log.Printf("[events] event log compaction failed: %v", err)
+		}
+	}
+	return nil
 }
 
 func (b *RabbitBroker) markProcessed(evt BookUpdateEvent) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.processed[evt.EventID] = struct{}{}
+	b.rememberLocked(evt.EventID)
 	if evt.Version > 0 && evt.Version > b.maxVersion[evt.BookID] {
 		b.maxVersion[evt.BookID] = evt.Version
 	}
@@ -312,6 +394,14 @@ func NewRabbitBroker(amqpURL string) (*RabbitBroker, error) {
 	if statePath == "" {
 		return nil, errors.New("EVENT_VERSION_STATE_PATH is required")
 	}
+	var queueTTL time.Duration
+	if v := strings.TrimSpace(os.Getenv("EVENT_QUEUE_TTL")); v != "" {
+		ttl, err := time.ParseDuration(v)
+		if err != nil || ttl <= 0 {
+			return nil, fmt.Errorf("EVENT_QUEUE_TTL must be a positive duration, got %q", v)
+		}
+		queueTTL = ttl
+	}
 	conn, err := amqp.Dial(amqpURL)
 	if err != nil {
 		return nil, fmt.Errorf("amqp dial: %w", err)
@@ -346,6 +436,7 @@ func NewRabbitBroker(amqpURL string) (*RabbitBroker, error) {
 		publisherConfirms:      publisherConfirms,
 		amqpURL:                amqpURL,
 		queueName:              queueName,
+		queueTTL:               queueTTL,
 		statePath:              statePath,
 		eventLogPath:           eventLogPath,
 		maxVersion:             make(map[string]int64),
@@ -387,6 +478,12 @@ func (b *RabbitBroker) Subscribe(ctx context.Context, h Handler) (func(), error)
 			cancel()
 			return nil, fmt.Errorf("persist replay state: %w", err)
 		}
+	}
+	b.logMu.Lock()
+	err = b.compactEventLogLocked()
+	b.logMu.Unlock()
+	if err != nil {
+		log.Printf("[events] event log compaction failed: %v", err)
 	}
 	go b.consumeWithReconnect(cancelCtx, h)
 
@@ -445,6 +542,12 @@ func (b *RabbitBroker) openConsumer() (*amqp.Connection, *amqp.Channel, <-chan a
 	args := amqp.Table{
 		"x-dead-letter-exchange":    "",
 		"x-dead-letter-routing-key": b.queueName + "_dlq",
+	}
+	if b.queueTTL > 0 {
+		// Lets RabbitMQ delete the queue of a replica that is gone for good.
+		// Changing it on an existing queue fails with PRECONDITION_FAILED, so the
+		// old queue must be deleted first.
+		args["x-expires"] = b.queueTTL.Milliseconds()
 	}
 	if _, err := ch.QueueDeclare(b.queueName+"_dlq", true, false, false, false, nil); err != nil {
 		_ = ch.Close()

@@ -206,17 +206,17 @@ func ExampleTinyLFUAdmission_PollutantScore() {
 
 func TestInMemoryCacheVictimIsLRUTail(t *testing.T) {
 	c := NewInMemoryCache(4, nil)
-	if _, ok := c.Victim(); ok {
+	if _, ok := c.VictimFor("a"); ok {
 		t.Fatal("expected no victim in empty cache")
 	}
 	for _, k := range []string{"a", "b", "c"} {
 		_ = c.Set(context.Background(), Item{Key: k}, Metrics{})
 	}
-	if got, _ := c.Victim(); got != "a" {
+	if got, _ := c.VictimFor("a"); got != "a" {
 		t.Fatalf("expected victim a, got %q", got)
 	}
 	_, _ = c.Get(context.Background(), "a")
-	if got, _ := c.Victim(); got != "b" {
+	if got, _ := c.VictimFor("a"); got != "b" {
 		t.Fatalf("expected victim b after touching a, got %q", got)
 	}
 }
