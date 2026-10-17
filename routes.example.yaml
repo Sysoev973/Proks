@@ -1,0 +1,22 @@
+# Invalidation tags by route for the library demo (cmd/upstream).
+# Load with ROUTES_CONFIG=routes.example.yaml.
+#
+# match:  path template; {name} captures one path segment.
+# tags:   tags attached to every cached response of the route; {name} refers
+#         to a capture, {query.name} to a query parameter.
+#
+# Tags sent by the upstream (Surrogate-Key, Cache-Tag, X-Cache-Depends-On)
+# are added to these. The first matching route wins.
+routes:
+  - match: /books/{id}
+    tags: ["book:{id}"]
+  - match: /books/{id}/authors
+    tags: ["book:{id}"]
+  - match: /books
+    tags: ["list:books"]
+  - match: /genres/{id}
+    tags: ["genre:{id}"]
+  - match: /genres
+    tags: ["list:genres"]
+  - match: /categories/{id}
+    tags: ["category:{id}"]

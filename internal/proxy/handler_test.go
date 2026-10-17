@@ -24,6 +24,23 @@ type noopPrefetcher struct{}
 
 func (noopPrefetcher) Enqueue(_ context.Context, _ string, _ prefetcher.PrefetchReason) {}
 
+// bookRoutes is the route config of the library demo (routes.example.yaml).
+var bookRoutes = []Route{
+	{Match: "/books/{id}", Tags: []string{"book:{id}"}},
+	{Match: "/books", Tags: []string{"list:books"}},
+}
+
+func newRoutedHandler(t *testing.T, c cache.Cache, pf prefetcher.Prefetcher, upstream string) *Handler {
+	t.Helper()
+	policy := DefaultCachePolicy()
+	policy.Routes = bookRoutes
+	h, err := NewHandlerWithPolicy(c, predictor.NewMarkov(), pf, upstream, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
 type recordingPrefetcher struct {
 	keys []string
 }
@@ -39,7 +56,7 @@ func TestBuildCacheKeyNormalizesQueryAndRoute(t *testing.T) {
 	req.Header.Set("X-Locale", "ru")
 
 	key := BuildCacheKey(req)
-	if key != "u1|t1|ru|book_view:123|a=1,3&b=2|vary:Accept-Encoding=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" {
+	if key != "u1|t1|ru|/books/123|a=1,3&b=2|vary:Accept-Encoding=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" {
 		t.Fatalf("unexpected key: %s", key)
 	}
 }
@@ -75,45 +92,45 @@ func TestMaybePrefetchThreshold(t *testing.T) {
 	c := cache.NewInMemoryCache(10, nil)
 	pf := &recordingPrefetcher{}
 	pred := predictor.NewMarkov()
-	pred.Update("book_view:1", "book_view:2")
-	pred.Update("book_view:1", "book_view:2")
-	pred.Update("book_view:1", "book_view:2")
-	pred.Update("book_view:1", "book_view:3")
-	pred.Update("book_view:1", "book_view:3")
+	pred.Update("/books/1", "/books/2")
+	pred.Update("/books/1", "/books/2")
+	pred.Update("/books/1", "/books/2")
+	pred.Update("/books/1", "/books/3")
+	pred.Update("/books/1", "/books/3")
 
 	h, err := NewHandler(c, pred, pf, "http://example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
 	h.prefetchThreshold = 0.7
-	h.maybePrefetch(context.Background(), "book_view:1")
+	h.maybePrefetchForRequest(context.Background(), httptest.NewRequest(http.MethodGet, "/books/1", nil), "/books/1")
 	if len(pf.keys) != 0 {
 		t.Fatalf("prefetch should not trigger below threshold")
 	}
 
-	pred.Update("book_view:1", "book_view:2")
+	pred.Update("/books/1", "/books/2")
 	h.prefetchThreshold = 0.6
-	h.maybePrefetch(context.Background(), "book_view:1")
-	if len(pf.keys) != 1 || pf.keys[0] != "book_view:2" {
-		t.Fatalf("expected prefetch for top candidate book_view:2, got %+v", pf.keys)
+	h.maybePrefetchForRequest(context.Background(), httptest.NewRequest(http.MethodGet, "/books/1", nil), "/books/1")
+	if len(pf.keys) != 1 || pf.keys[0] != BuildCacheKey(httptest.NewRequest(http.MethodGet, "/books/2", nil)) {
+		t.Fatalf("expected prefetch for top candidate /books/2, got %+v", pf.keys)
 	}
 }
 
 func TestMaybePrefetchSkipsPollutedCache(t *testing.T) {
 	filter := cache.NewTinyLFU()
 	for i := 0; i < 12; i++ {
-		filter.Increment("book_view:3")
+		filter.Increment("/books/3")
 	}
 	window := cache.NewLRUWindow(4)
 	c := cache.NewInMemoryCache(2, cache.NewTinyLFUAdmission(filter, window, 2, 0.5))
-	_ = c.Set(context.Background(), cache.Item{Key: "book_view:9", Value: []byte("a")}, cache.Metrics{})
-	_ = c.Set(context.Background(), cache.Item{Key: "book_view:10", Value: []byte("b")}, cache.Metrics{})
+	_ = c.Set(context.Background(), cache.Item{Key: "/books/9", Value: []byte("a")}, cache.Metrics{})
+	_ = c.Set(context.Background(), cache.Item{Key: "/books/10", Value: []byte("b")}, cache.Metrics{})
 
 	pf := &recordingPrefetcher{}
 	pred := predictor.NewMarkov()
-	pred.Update("book_view:1", "book_view:2")
-	pred.Update("book_view:1", "book_view:2")
-	pred.Update("book_view:1", "book_view:2")
+	pred.Update("/books/1", "/books/2")
+	pred.Update("/books/1", "/books/2")
+	pred.Update("/books/1", "/books/2")
 
 	h, err := NewHandler(c, pred, pf, "http://example.com")
 	if err != nil {
@@ -124,7 +141,7 @@ func TestMaybePrefetchSkipsPollutedCache(t *testing.T) {
 	if _, ok := c.Admission().(*cache.TinyLFUAdmission); !ok {
 		t.Fatal("expected TinyLFU admission to be active")
 	}
-	h.maybePrefetch(context.Background(), "book_view:1")
+	h.maybePrefetchForRequest(context.Background(), httptest.NewRequest(http.MethodGet, "/books/1", nil), "/books/1")
 	if len(pf.keys) != 0 {
 		t.Fatalf("expected polluted cache to suppress prefetch, got %+v", pf.keys)
 	}
@@ -187,7 +204,7 @@ func TestServeHTTPTTLExpiry(t *testing.T) {
 
 	c := cache.NewInMemoryCache(10, nil)
 	_ = c.Set(context.Background(), cache.Item{
-		Key:        "u|t|l|book_view:4|",
+		Key:        "u|t|l|/books/4|",
 		Value:      []byte("stale"),
 		StatusCode: http.StatusOK,
 		ExpiresAt:  time.Now().Add(-1 * time.Second),
@@ -215,7 +232,7 @@ func TestServeHTTPTTLExpiry(t *testing.T) {
 
 func TestBookUpdatedEndpointInvalidatesByVersion(t *testing.T) {
 	c := cache.NewInMemoryCache(32, nil)
-	key := "u|t|ru|book_view:42|"
+	key := "u|t|ru|/books/42|"
 	_ = c.Set(context.Background(), cache.Item{Key: key, Value: []byte("old"), StatusCode: http.StatusOK, ExpiresAt: time.Now().Add(time.Minute), Version: 12, Tags: []string{"book:42"}}, cache.Metrics{})
 
 	pf := prefetcher.NewAsyncPrefetcher(1, 8, 20*time.Millisecond, func(ctx context.Context, key string) error { return nil }, nil)
@@ -237,7 +254,7 @@ func TestBookUpdatedEndpointInvalidatesByVersion(t *testing.T) {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		var evt events.BookUpdateEvent
+		var evt events.Event
 		if err := json.NewDecoder(r.Body).Decode(&evt); err != nil {
 			http.Error(w, "invalid event", http.StatusBadRequest)
 			return
@@ -275,10 +292,7 @@ func TestE2EBook(t *testing.T) {
 
 	// Запуск кэша, прокси и шины событий
 	c := cache.NewInMemoryCache(32, nil)
-	h, err := NewHandler(c, predictor.NewMarkov(), noopPrefetcher{}, upstream.URL)
-	if err != nil {
-		t.Fatalf("failed to create handler: %v", err)
-	}
+	h := newRoutedHandler(t, c, noopPrefetcher{}, upstream.URL)
 
 	broker := events.NewInMemoryBroker()
 	h.SetEventStream(broker)
@@ -293,7 +307,7 @@ func TestE2EBook(t *testing.T) {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		var evt events.BookUpdateEvent
+		var evt events.Event
 		if err := json.NewDecoder(r.Body).Decode(&evt); err != nil {
 			http.Error(w, "invalid event", http.StatusBadRequest)
 			return
@@ -367,7 +381,7 @@ func TestEnqueuedPrefetchDoesNotTurnHitIntoPrefetch(t *testing.T) {
 	c := cache.NewInMemoryCache(10, nil)
 	pf := &recordingPrefetcher{}
 	pred := predictor.NewMarkov()
-	pred.Update("book_view:1", "book_view:2")
+	pred.Update("/books/1", "/books/2")
 
 	h, err := NewHandler(c, pred, pf, "http://example.com")
 	if err != nil {
@@ -375,7 +389,7 @@ func TestEnqueuedPrefetchDoesNotTurnHitIntoPrefetch(t *testing.T) {
 	}
 	h.trend = nil
 	h.prefetchThreshold = 0.5
-	h.maybePrefetch(context.Background(), "book_view:1")
+	h.maybePrefetchForRequest(context.Background(), httptest.NewRequest(http.MethodGet, "/books/1", nil), "/books/1")
 	if len(pf.keys) != 1 {
 		t.Fatalf("expected one enqueued prefetch, got %+v", pf.keys)
 	}
@@ -393,7 +407,7 @@ func TestMaybePrefetchSkipsDisabledPrefetcher(t *testing.T) {
 	pf := prefetcher.NewAsyncPrefetcher(1, 8, 20*time.Millisecond, nil, nil)
 	defer pf.Stop()
 	pred := predictor.NewMarkov()
-	pred.Update("book_view:1", "book_view:2")
+	pred.Update("/books/1", "/books/2")
 
 	h, err := NewHandler(cache.NewInMemoryCache(10, nil), pred, pf, "http://example.com")
 	if err != nil {
@@ -401,7 +415,7 @@ func TestMaybePrefetchSkipsDisabledPrefetcher(t *testing.T) {
 	}
 	h.trend = nil
 	h.prefetchThreshold = 0.5
-	h.maybePrefetch(context.Background(), "book_view:1")
+	h.maybePrefetchForRequest(context.Background(), httptest.NewRequest(http.MethodGet, "/books/1", nil), "/books/1")
 	if got := pf.Snapshot().Enqueued; got != 0 {
 		t.Fatalf("disabled prefetcher must not enqueue, got %d", got)
 	}

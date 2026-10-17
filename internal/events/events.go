@@ -12,40 +12,102 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-type BookUpdateEvent struct {
-	EventID string `json:"event_id"`
-	Type    string `json:"type,omitempty"`
-	BookID  string `json:"book_id"`
+const (
+	// TypeInvalidate drops every cached response carrying one of Tags and the
+	// responses stored under Keys.
+	TypeInvalidate = "invalidate"
+	// TypeBookUpdated is the legacy form {"type":"book.updated","book_id":"1"}.
+	// It is accepted everywhere and turned into an invalidate event with the
+	// tag "book:<book_id>".
+	TypeBookUpdated = "book.updated"
+)
+
+const (
+	MaxTagLength    = 256
+	MaxKeyLength    = 4096
+	MaxEventTargets = 1000
+)
+
+// Event is an invalidation published to every proxy replica.
+type Event struct {
+	EventID string   `json:"event_id"`
+	Type    string   `json:"type"`
+	Tags    []string `json:"tags,omitempty"`
+	Keys    []string `json:"keys,omitempty"`
+	// BookID is only read from legacy book.updated events.
+	BookID  string `json:"book_id,omitempty"`
 	Version int64  `json:"version"`
 }
 
-type Event = BookUpdateEvent
-
-type Handler func(ctx context.Context, event BookUpdateEvent) error
+type Handler func(ctx context.Context, event Event) error
 
 type Stream interface {
 	Subscribe(ctx context.Context, h Handler) (func(), error)
-	Publish(ctx context.Context, evt BookUpdateEvent) error
+	Publish(ctx context.Context, evt Event) error
 }
 
-func ValidateBookUpdateEvent(evt BookUpdateEvent) error {
-	if evt.Type != "book.updated" {
-		return fmt.Errorf("book.updated: invalid type %q", evt.Type)
+// ValidTag reports whether tag can be used for invalidation: non-empty, at
+// most MaxTagLength bytes, letters, digits and ":_-./@+=" only. Any prefix
+// is accepted.
+func ValidTag(tag string) bool {
+	if tag == "" || len(tag) > MaxTagLength {
+		return false
 	}
-	if evt.BookID == "" {
-		return fmt.Errorf("book.updated: book_id is required")
+	for _, r := range tag {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || strings.ContainsRune(":_-./@+=", r) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// Normalize validates evt and rewrites a legacy book.updated event into an
+// invalidate event.
+func Normalize(evt Event) (Event, error) {
+	switch evt.Type {
+	case TypeBookUpdated:
+		if evt.BookID == "" {
+			return evt, fmt.Errorf("book.updated: book_id is required")
+		}
+		evt.Type = TypeInvalidate
+		evt.Tags = append(evt.Tags, "book:"+evt.BookID)
+		evt.BookID = ""
+	case TypeInvalidate:
+		if evt.BookID != "" {
+			return evt, fmt.Errorf("invalidate: book_id is only allowed with type %q", TypeBookUpdated)
+		}
+	default:
+		return evt, fmt.Errorf("invalid event type %q", evt.Type)
 	}
 	if evt.Version < 0 {
-		return fmt.Errorf("book.updated: version must be non-negative")
+		return evt, fmt.Errorf("%s: version must be non-negative", evt.Type)
 	}
-	return nil
+	if len(evt.Tags)+len(evt.Keys) == 0 {
+		return evt, fmt.Errorf("%s: tags or keys are required", evt.Type)
+	}
+	if len(evt.Tags)+len(evt.Keys) > MaxEventTargets {
+		return evt, fmt.Errorf("%s: at most %d tags and keys per event", evt.Type, MaxEventTargets)
+	}
+	for _, tag := range evt.Tags {
+		if !ValidTag(tag) {
+			return evt, fmt.Errorf("%s: invalid tag %q", evt.Type, tag)
+		}
+	}
+	for _, key := range evt.Keys {
+		if key == "" || len(key) > MaxKeyLength {
+			return evt, fmt.Errorf("%s: invalid key", evt.Type)
+		}
+	}
+	return evt, nil
 }
 
-func ensureEventID(evt *BookUpdateEvent) {
+func ensureEventID(evt *Event) {
 	if strings.TrimSpace(evt.EventID) != "" {
 		return
 	}
@@ -55,6 +117,33 @@ func ensureEventID(evt *BookUpdateEvent) {
 		return
 	}
 	evt.EventID = fmt.Sprintf("%x", buf)
+}
+
+// supersededLocked reports whether every tag of a versioned event has
+// already been invalidated at this or a newer version. Unversioned events and
+// events with keys are never superseded: keys carry no version, so dropping
+// the event would lose the key purge.
+func supersededLocked(maxVersion map[string]int64, evt Event) bool {
+	if evt.Version <= 0 || len(evt.Tags) == 0 || len(evt.Keys) > 0 {
+		return false
+	}
+	for _, tag := range evt.Tags {
+		if evt.Version > maxVersion[tag] {
+			return false
+		}
+	}
+	return true
+}
+
+func commitVersionLocked(maxVersion map[string]int64, evt Event) {
+	if evt.Version <= 0 {
+		return
+	}
+	for _, tag := range evt.Tags {
+		if evt.Version > maxVersion[tag] {
+			maxVersion[tag] = evt.Version
+		}
+	}
 }
 
 // === InMemoryBroker ===
@@ -87,9 +176,10 @@ func (b *InMemoryBroker) Subscribe(_ context.Context, h Handler) (func(), error)
 	return stopFn, nil
 }
 
-func (b *InMemoryBroker) Publish(ctx context.Context, evt BookUpdateEvent) error {
+func (b *InMemoryBroker) Publish(ctx context.Context, evt Event) error {
 	ensureEventID(&evt)
-	if err := ValidateBookUpdateEvent(evt); err != nil {
+	evt, err := Normalize(evt)
+	if err != nil {
 		return err
 	}
 	b.mu.Lock()
@@ -97,8 +187,7 @@ func (b *InMemoryBroker) Publish(ctx context.Context, evt BookUpdateEvent) error
 		b.mu.Unlock()
 		return nil
 	}
-	lastVer := b.maxVersion[evt.BookID]
-	if evt.Version > 0 && evt.Version <= lastVer {
+	if supersededLocked(b.maxVersion, evt) {
 		b.mu.Unlock()
 		return nil
 	}
@@ -109,36 +198,88 @@ func (b *InMemoryBroker) Publish(ctx context.Context, evt BookUpdateEvent) error
 		if err := h(ctx, evt); err != nil {
 			return err
 		}
-		b.mu.Lock()
-		b.processed[evt.EventID] = struct{}{}
-		if evt.Version > 0 && evt.Version > b.maxVersion[evt.BookID] {
-			b.maxVersion[evt.BookID] = evt.Version
-		}
-		b.mu.Unlock()
-	} else {
-		b.mu.Lock()
-		b.processed[evt.EventID] = struct{}{}
-		if evt.Version > 0 {
-			b.maxVersion[evt.BookID] = evt.Version
-		}
-		b.mu.Unlock()
 	}
+	b.mu.Lock()
+	b.processed[evt.EventID] = struct{}{}
+	commitVersionLocked(b.maxVersion, evt)
+	b.mu.Unlock()
 	return nil
 }
 
-func (b *InMemoryBroker) LastVersion(bookID string) int64 {
+// LastVersion returns the newest version invalidated for tag.
+func (b *InMemoryBroker) LastVersion(tag string) int64 {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	return b.maxVersion[bookID]
+	return b.maxVersion[tag]
 }
 
-//RabbitBroker
+// === AMQP seams ===
+//
+// RabbitBroker talks to RabbitMQ only through these interfaces, so tests can
+// drop connections, delay or lose publisher confirms and fail handlers
+// without a broker.
+
+type amqpChannel interface {
+	ExchangeDeclare(name, kind string, durable, autoDelete, internal, noWait bool, args amqp.Table) error
+	QueueDeclare(name string, durable, autoDelete, exclusive, noWait bool, args amqp.Table) (amqp.Queue, error)
+	QueueBind(name, key, exchange string, noWait bool, args amqp.Table) error
+	Consume(queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args amqp.Table) (<-chan amqp.Delivery, error)
+	Confirm(noWait bool) error
+	PublishWithContext(ctx context.Context, exchange, key string, mandatory, immediate bool, msg amqp.Publishing) error
+	NotifyClose(c chan *amqp.Error) chan *amqp.Error
+	NotifyCancel(c chan string) chan string
+	NotifyPublish(confirm chan amqp.Confirmation) chan amqp.Confirmation
+	Close() error
+}
+
+type amqpConnection interface {
+	Channel() (amqpChannel, error)
+	NotifyClose(receiver chan *amqp.Error) chan *amqp.Error
+	Close() error
+}
+
+type dialFunc func(url string) (amqpConnection, error)
+
+type amqpConn struct{ *amqp.Connection }
+
+func (c amqpConn) Channel() (amqpChannel, error) {
+	ch, err := c.Connection.Channel()
+	if err != nil {
+		return nil, err
+	}
+	return ch, nil
+}
+
+func dialAMQP(url string) (amqpConnection, error) {
+	conn, err := amqp.Dial(url)
+	if err != nil {
+		return nil, err
+	}
+	return amqpConn{conn}, nil
+}
+
+// === RabbitBroker ===
+
+const (
+	exchangeName = "events"
+	// routingKey is what Publish uses; consumers also bind the legacy key so
+	// events from older publishers keep arriving during a rolling upgrade.
+	routingKey       = TypeInvalidate
+	legacyRoutingKey = TypeBookUpdated
+
+	defaultConfirmTimeout = 5 * time.Second
+	defaultRetryBackoff   = 100 * time.Millisecond
+	handlerAttempts       = 3
+)
+
+var errConfirmTimeout = errors.New("rabbitmq publisher confirm timed out")
 
 type RabbitBroker struct {
-	conn                   *amqp.Connection
-	ch                     *amqp.Channel
-	publisherConn          *amqp.Connection
-	publisherCh            *amqp.Channel
+	dial                   dialFunc
+	conn                   amqpConnection
+	ch                     amqpChannel
+	publisherConn          amqpConnection
+	publisherCh            amqpChannel
 	publisherClosed        <-chan *amqp.Error
 	publisherChannelClosed <-chan *amqp.Error
 	publisherConfirms      <-chan amqp.Confirmation
@@ -148,6 +289,8 @@ type RabbitBroker struct {
 	statePath              string
 	eventLogPath           string
 	queueTTL               time.Duration
+	confirmTimeout         time.Duration
+	retryBackoff           time.Duration
 	handler                Handler
 	mu                     sync.RWMutex
 	maxVersion             map[string]int64
@@ -157,13 +300,8 @@ type RabbitBroker struct {
 	appendedSinceCompact   int
 }
 
-// maxProcessedEvents bounds the remembered event IDs. Forgetting an old ID is
-// safe: versioned events are still ordered by maxVersion, and re-applying an
-// unversioned invalidation only drops cache entries again.
 const maxProcessedEvents = 10_000
 
-// rememberLocked records eventID as processed, forgetting the oldest IDs
-// beyond maxProcessedEvents.
 func (b *RabbitBroker) rememberLocked(eventID string) {
 	if _, ok := b.processed[eventID]; ok {
 		return
@@ -196,16 +334,31 @@ func (b *RabbitBroker) loadVersions() error {
 	}
 	var state persistedState
 	if json.Unmarshal(data, &state) == nil && state.Versions != nil {
-		b.maxVersion = state.Versions
+		b.maxVersion = migrateVersionKeys(state.Versions)
 		for _, eventID := range state.Processed {
 			b.rememberLocked(eventID)
 		}
 		return nil
 	}
-	if err := json.Unmarshal(data, &b.maxVersion); err != nil {
+	var versions map[string]int64
+	if err := json.Unmarshal(data, &versions); err != nil {
 		return fmt.Errorf("decode version state: %w", err)
 	}
+	b.maxVersion = migrateVersionKeys(versions)
 	return nil
+}
+
+func migrateVersionKeys(versions map[string]int64) map[string]int64 {
+	out := make(map[string]int64, len(versions))
+	for key, version := range versions {
+		if !strings.Contains(key, ":") {
+			key = "book:" + key
+		}
+		if version > out[key] {
+			out[key] = version
+		}
+	}
+	return out
 }
 
 func (b *RabbitBroker) persistVersionsLocked() error {
@@ -228,7 +381,7 @@ func (b *RabbitBroker) persistVersionsLocked() error {
 	return os.Rename(tmp, b.statePath)
 }
 
-func (b *RabbitBroker) loadEventLog() ([]BookUpdateEvent, error) {
+func (b *RabbitBroker) loadEventLog() ([]Event, error) {
 	if b.eventLogPath == "" {
 		return nil, errors.New("EVENT_LOG_PATH is required")
 	}
@@ -239,16 +392,17 @@ func (b *RabbitBroker) loadEventLog() ([]BookUpdateEvent, error) {
 		}
 		return nil, fmt.Errorf("read event log: %w", err)
 	}
-	var result []BookUpdateEvent
+	var result []Event
 	for _, line := range strings.Split(string(data), "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		var evt BookUpdateEvent
+		var evt Event
 		if err := json.Unmarshal([]byte(line), &evt); err != nil {
 			return nil, fmt.Errorf("decode event log: %w", err)
 		}
-		if err := ValidateBookUpdateEvent(evt); err != nil {
+		evt, err := Normalize(evt)
+		if err != nil {
 			return nil, fmt.Errorf("invalid event log record: %w", err)
 		}
 		result = append(result, evt)
@@ -260,18 +414,15 @@ func (b *RabbitBroker) loadEventLog() ([]BookUpdateEvent, error) {
 const eventLogCompactEvery = 1000
 
 // alreadyApplied reports whether replaying evt would be a no-op.
-func (b *RabbitBroker) alreadyApplied(evt BookUpdateEvent) bool {
+func (b *RabbitBroker) alreadyApplied(evt Event) bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if _, ok := b.processed[evt.EventID]; ok {
 		return true
 	}
-	return evt.Version > 0 && evt.Version <= b.maxVersion[evt.BookID]
+	return supersededLocked(b.maxVersion, evt)
 }
 
-// compactEventLogLocked rewrites the event log keeping only events that have
-// not been applied yet, so the log stays small and startup replays only what
-// is still pending. b.logMu must be held.
 func (b *RabbitBroker) compactEventLogLocked() error {
 	if b.eventLogPath == "" {
 		return nil
@@ -302,7 +453,7 @@ func (b *RabbitBroker) compactEventLogLocked() error {
 	return nil
 }
 
-func (b *RabbitBroker) appendEvent(evt BookUpdateEvent) error {
+func (b *RabbitBroker) appendEvent(evt Event) error {
 	if b.eventLogPath == "" {
 		return nil
 	}
@@ -341,48 +492,66 @@ func (b *RabbitBroker) appendEvent(evt BookUpdateEvent) error {
 	return nil
 }
 
-func (b *RabbitBroker) markProcessed(evt BookUpdateEvent) error {
+func (b *RabbitBroker) markProcessed(evt Event) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.rememberLocked(evt.EventID)
-	if evt.Version > 0 && evt.Version > b.maxVersion[evt.BookID] {
-		b.maxVersion[evt.BookID] = evt.Version
-	}
+	commitVersionLocked(b.maxVersion, evt)
 	return b.persistVersionsLocked()
 }
 
-func (b *RabbitBroker) isProcessed(eventID string) bool {
+// LastVersion returns the newest version invalidated for tag.
+func (b *RabbitBroker) LastVersion(tag string) int64 {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	_, ok := b.processed[eventID]
-	return ok
+	return b.maxVersion[tag]
 }
 
-func openPublisher(amqpURL string) (*amqp.Connection, *amqp.Channel, <-chan *amqp.Error, <-chan *amqp.Error, <-chan amqp.Confirmation, error) {
-	conn, err := amqp.Dial(amqpURL)
+type publisher struct {
+	conn          amqpConnection
+	ch            amqpChannel
+	closed        <-chan *amqp.Error
+	channelClosed <-chan *amqp.Error
+	confirms      <-chan amqp.Confirmation
+}
+
+func openPublisher(dial dialFunc, amqpURL string) (publisher, error) {
+	conn, err := dial(amqpURL)
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("publisher amqp dial: %w", err)
+		return publisher{}, fmt.Errorf("publisher amqp dial: %w", err)
 	}
 	ch, err := conn.Channel()
 	if err != nil {
 		_ = conn.Close()
-		return nil, nil, nil, nil, nil, fmt.Errorf("publisher amqp channel: %w", err)
+		return publisher{}, fmt.Errorf("publisher amqp channel: %w", err)
 	}
-	if err := ch.ExchangeDeclare("events", "topic", true, false, false, false, nil); err != nil {
+	if err := ch.ExchangeDeclare(exchangeName, "topic", true, false, false, false, nil); err != nil {
 		_ = ch.Close()
 		_ = conn.Close()
-		return nil, nil, nil, nil, nil, err
+		return publisher{}, err
 	}
 	if err := ch.Confirm(false); err != nil {
 		_ = ch.Close()
 		_ = conn.Close()
-		return nil, nil, nil, nil, nil, fmt.Errorf("enable publisher confirms: %w", err)
+		return publisher{}, fmt.Errorf("enable publisher confirms: %w", err)
 	}
-	return conn, ch, conn.NotifyClose(make(chan *amqp.Error, 1)), ch.NotifyClose(make(chan *amqp.Error, 1)), ch.NotifyPublish(make(chan amqp.Confirmation, 1)), nil
+	return publisher{
+		conn:          conn,
+		ch:            ch,
+		closed:        conn.NotifyClose(make(chan *amqp.Error, 1)),
+		channelClosed: ch.NotifyClose(make(chan *amqp.Error, 1)),
+		confirms:      ch.NotifyPublish(make(chan amqp.Confirmation, 1)),
+	}, nil
 }
 
 func NewRabbitBroker(amqpURL string) (*RabbitBroker, error) {
-	queueName := consumerQueueName("book.updated")
+	return newRabbitBroker(amqpURL, dialAMQP)
+}
+
+func newRabbitBroker(amqpURL string, dial dialFunc) (*RabbitBroker, error) {
+	// The queue keeps its historical name so a restarted replica picks up
+	// the durable queue (and any messages) it had before invalidate events.
+	queueName := consumerQueueName(legacyRoutingKey)
 	if queueName == "" {
 		return nil, errors.New("PROXY_REPLICA_ID is required")
 	}
@@ -402,43 +571,25 @@ func NewRabbitBroker(amqpURL string) (*RabbitBroker, error) {
 		}
 		queueTTL = ttl
 	}
-	conn, err := amqp.Dial(amqpURL)
+	pub, err := openPublisher(dial, amqpURL)
 	if err != nil {
-		return nil, fmt.Errorf("amqp dial: %w", err)
-	}
-
-	ch, err := conn.Channel()
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("amqp channel: %w", err)
-	}
-
-	err = ch.ExchangeDeclare("events", "topic", true, false, false, false, nil)
-	if err != nil {
-		ch.Close()
-		conn.Close()
-		return nil, err
-	}
-	publisherConn, publisherCh, publisherClosed, publisherChannelClosed, publisherConfirms, err := openPublisher(amqpURL)
-	if err != nil {
-		_ = ch.Close()
-		_ = conn.Close()
 		return nil, err
 	}
 
 	broker := &RabbitBroker{
-		conn:                   conn,
-		ch:                     ch,
-		publisherConn:          publisherConn,
-		publisherCh:            publisherCh,
-		publisherClosed:        publisherClosed,
-		publisherChannelClosed: publisherChannelClosed,
-		publisherConfirms:      publisherConfirms,
+		dial:                   dial,
+		publisherConn:          pub.conn,
+		publisherCh:            pub.ch,
+		publisherClosed:        pub.closed,
+		publisherChannelClosed: pub.channelClosed,
+		publisherConfirms:      pub.confirms,
 		amqpURL:                amqpURL,
 		queueName:              queueName,
 		queueTTL:               queueTTL,
 		statePath:              statePath,
 		eventLogPath:           eventLogPath,
+		confirmTimeout:         defaultConfirmTimeout,
+		retryBackoff:           defaultRetryBackoff,
 		maxVersion:             make(map[string]int64),
 		processed:              make(map[string]struct{}),
 	}
@@ -461,16 +612,10 @@ func (b *RabbitBroker) Subscribe(ctx context.Context, h Handler) (func(), error)
 		return nil, err
 	}
 	for _, evt := range events {
-		if b.isProcessed(evt.EventID) {
+		if b.alreadyApplied(evt) {
 			continue
 		}
-		b.mu.RLock()
-		lastVersion := b.maxVersion[evt.BookID]
-		b.mu.RUnlock()
-		if evt.Version > 0 && evt.Version <= lastVersion {
-			continue
-		}
-		if err := b.processWithRetry(cancelCtx, h, evt, 3); err != nil {
+		if err := b.processWithRetry(cancelCtx, h, evt, handlerAttempts); err != nil {
 			cancel()
 			return nil, fmt.Errorf("replay event %s: %w", evt.EventID, err)
 		}
@@ -485,9 +630,16 @@ func (b *RabbitBroker) Subscribe(ctx context.Context, h Handler) (func(), error)
 	if err != nil {
 		log.Printf("[events] event log compaction failed: %v", err)
 	}
-	go b.consumeWithReconnect(cancelCtx, h)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.consumeWithReconnect(cancelCtx, h)
+	}()
 
-	return cancel, nil
+	return func() {
+		cancel()
+		<-done
+	}, nil
 }
 
 func (b *RabbitBroker) consumeWithReconnect(ctx context.Context, h Handler) {
@@ -514,13 +666,16 @@ func (b *RabbitBroker) consumeWithReconnect(ctx context.Context, h Handler) {
 		b.conn, b.ch = conn, ch
 		b.mu.Unlock()
 		b.consumeUntilClosed(ctx, msgs, closed, canceled, h)
+		b.mu.Lock()
+		b.conn, b.ch = nil, nil
+		b.mu.Unlock()
 		_ = ch.Close()
 		_ = conn.Close()
 	}
 }
 
-func (b *RabbitBroker) openConsumer() (*amqp.Connection, *amqp.Channel, <-chan amqp.Delivery, <-chan *amqp.Error, <-chan string, error) {
-	conn, err := amqp.Dial(b.amqpURL)
+func (b *RabbitBroker) openConsumer() (amqpConnection, amqpChannel, <-chan amqp.Delivery, <-chan *amqp.Error, <-chan string, error) {
+	conn, err := b.dial(b.amqpURL)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
 	}
@@ -529,15 +684,13 @@ func (b *RabbitBroker) openConsumer() (*amqp.Connection, *amqp.Channel, <-chan a
 		_ = conn.Close()
 		return nil, nil, nil, nil, nil, err
 	}
-	if err := ch.ExchangeDeclare("events", "topic", true, false, false, false, nil); err != nil {
+	fail := func(err error) (amqpConnection, amqpChannel, <-chan amqp.Delivery, <-chan *amqp.Error, <-chan string, error) {
 		_ = ch.Close()
 		_ = conn.Close()
 		return nil, nil, nil, nil, nil, err
 	}
-	if err := ch.Confirm(false); err != nil {
-		_ = ch.Close()
-		_ = conn.Close()
-		return nil, nil, nil, nil, nil, err
+	if err := ch.ExchangeDeclare(exchangeName, "topic", true, false, false, false, nil); err != nil {
+		return fail(err)
 	}
 	args := amqp.Table{
 		"x-dead-letter-exchange":    "",
@@ -550,26 +703,20 @@ func (b *RabbitBroker) openConsumer() (*amqp.Connection, *amqp.Channel, <-chan a
 		args["x-expires"] = b.queueTTL.Milliseconds()
 	}
 	if _, err := ch.QueueDeclare(b.queueName+"_dlq", true, false, false, false, nil); err != nil {
-		_ = ch.Close()
-		_ = conn.Close()
-		return nil, nil, nil, nil, nil, err
+		return fail(err)
 	}
 	q, err := ch.QueueDeclare(b.queueName, true, false, false, false, args)
 	if err != nil {
-		_ = ch.Close()
-		_ = conn.Close()
-		return nil, nil, nil, nil, nil, err
+		return fail(err)
 	}
-	if err := ch.QueueBind(q.Name, "book.updated", "events", false, nil); err != nil {
-		_ = ch.Close()
-		_ = conn.Close()
-		return nil, nil, nil, nil, nil, err
+	for _, key := range []string{routingKey, legacyRoutingKey} {
+		if err := ch.QueueBind(q.Name, key, exchangeName, false, nil); err != nil {
+			return fail(err)
+		}
 	}
 	msgs, err := ch.Consume(q.Name, "", false, false, false, false, nil)
 	if err != nil {
-		_ = ch.Close()
-		_ = conn.Close()
-		return nil, nil, nil, nil, nil, err
+		return fail(err)
 	}
 	return conn, ch, msgs, ch.NotifyClose(make(chan *amqp.Error, 1)), ch.NotifyCancel(make(chan string, 1)), nil
 }
@@ -587,24 +734,22 @@ func (b *RabbitBroker) consumeUntilClosed(ctx context.Context, msgs <-chan amqp.
 			if !ok {
 				return
 			}
-			var ev BookUpdateEvent
-			if err := json.Unmarshal(d.Body, &ev); err != nil || ValidateBookUpdateEvent(ev) != nil {
+			var ev Event
+			if err := json.Unmarshal(d.Body, &ev); err != nil {
 				_ = d.Nack(false, false)
 				continue
 			}
-			if b.isProcessed(ev.EventID) {
+			ev, err := Normalize(ev)
+			if err != nil {
+				_ = d.Nack(false, false)
+				continue
+			}
+			if b.alreadyApplied(ev) {
 				_ = d.Ack(false)
 				continue
 			}
-			b.mu.RLock()
-			lastVersion := b.maxVersion[ev.BookID]
-			b.mu.RUnlock()
-			if ev.Version > 0 && ev.Version <= lastVersion {
-				_ = d.Ack(false)
-				continue
-			}
-			if err := b.processWithRetry(ctx, h, ev, 3); err != nil {
-				log.Printf("[events] failed to process event: %v", err)
+			if err := b.processWithRetry(ctx, h, ev, handlerAttempts); err != nil {
+				log.Printf("[events] failed to process event %s after %d attempts, sending to DLQ: %v", ev.EventID, handlerAttempts, err)
 				_ = d.Nack(false, false)
 				continue
 			}
@@ -618,60 +763,19 @@ func (b *RabbitBroker) consumeUntilClosed(ctx context.Context, msgs <-chan amqp.
 	}
 }
 
-func (b *RabbitBroker) consume(ctx context.Context, msgs <-chan amqp.Delivery, h Handler) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case d, ok := <-msgs:
-			if !ok {
-				return
-			}
-			var ev BookUpdateEvent
-			if err := json.Unmarshal(d.Body, &ev); err != nil {
-				d.Nack(false, false)
-				continue
-			}
-			if err := ValidateBookUpdateEvent(ev); err != nil {
-				d.Nack(false, false)
-				continue
-			}
-			if b.isProcessed(ev.EventID) {
-				d.Ack(false)
-				continue
-			}
-
-			b.mu.Lock()
-			lastVer := b.maxVersion[ev.BookID]
-			if ev.Version > 0 && ev.Version <= lastVer {
-				b.mu.Unlock()
-				d.Ack(false)
-				continue
-			}
-			b.mu.Unlock()
-
-			if err := b.processWithRetry(ctx, h, ev, 3); err != nil {
-				log.Printf("[events] Failed to process event after retries, sending to DLQ: %v", err)
-				d.Nack(false, false)
-			} else {
-				if err := b.markProcessed(ev); err != nil {
-					log.Printf("[events] failed to persist event state: %v", err)
-					d.Nack(false, false)
-					continue
-				}
-				d.Ack(false)
-			}
-		}
-	}
-}
-
-func (b *RabbitBroker) processWithRetry(ctx context.Context, h Handler, ev BookUpdateEvent, maxAttempts int) error {
+func (b *RabbitBroker) processWithRetry(ctx context.Context, h Handler, ev Event, maxAttempts int) error {
 	var err error
-	backoff := 100 * time.Millisecond
+	backoff := b.retryBackoff
+	if backoff <= 0 {
+		backoff = defaultRetryBackoff
+	}
 
 	for i := 0; i < maxAttempts; i++ {
 		if err = h(ctx, ev); err == nil {
 			return nil
+		}
+		if i == maxAttempts-1 {
+			break
 		}
 		select {
 		case <-ctx.Done():
@@ -691,9 +795,10 @@ func consumerQueueName(topic string) string {
 	return "proxy_" + topic + "_" + replicaID
 }
 
-func (b *RabbitBroker) Publish(ctx context.Context, evt BookUpdateEvent) error {
+func (b *RabbitBroker) Publish(ctx context.Context, evt Event) error {
 	ensureEventID(&evt)
-	if err := ValidateBookUpdateEvent(evt); err != nil {
+	evt, err := Normalize(evt)
+	if err != nil {
 		return err
 	}
 	body, err := json.Marshal(evt)
@@ -720,6 +825,8 @@ func (b *RabbitBroker) Publish(ctx context.Context, evt BookUpdateEvent) error {
 			b.discardPublisher()
 			return ctx.Err()
 		}
+		// Also after a confirm timeout: the old channel is closed, so a late
+		// confirm for this message can never be taken for the retry's.
 		if err := b.reconnectPublisher(); err != nil {
 			lastErr = err
 			break
@@ -734,9 +841,13 @@ func (b *RabbitBroker) publishOnce(ctx context.Context, body []byte) error {
 	closed := b.publisherClosed
 	channelClosed := b.publisherChannelClosed
 	confirms := b.publisherConfirms
+	timeout := b.confirmTimeout
 	b.mu.RUnlock()
 	if ch == nil || closed == nil || channelClosed == nil || confirms == nil {
 		return errors.New("rabbitmq publisher channel unavailable")
+	}
+	if timeout <= 0 {
+		timeout = defaultConfirmTimeout
 	}
 	select {
 	case <-closed:
@@ -745,13 +856,15 @@ func (b *RabbitBroker) publishOnce(ctx context.Context, body []byte) error {
 		return errors.New("rabbitmq publisher channel is closed")
 	default:
 	}
-	if err := ch.PublishWithContext(ctx, "events", "book.updated", false, false, amqp.Publishing{
+	if err := ch.PublishWithContext(ctx, exchangeName, routingKey, false, false, amqp.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
 		Body:         body,
 	}); err != nil {
 		return err
 	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case confirmation := <-confirms:
 		if !confirmation.Ack {
@@ -762,6 +875,8 @@ func (b *RabbitBroker) publishOnce(ctx context.Context, body []byte) error {
 		return errors.New("rabbitmq publisher connection closed before confirm")
 	case <-channelClosed:
 		return errors.New("rabbitmq publisher channel closed before confirm")
+	case <-timer.C:
+		return errConfirmTimeout
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -773,16 +888,16 @@ func (b *RabbitBroker) reconnectPublisher() error {
 	oldConn := b.publisherConn
 	oldCh := b.publisherCh
 	b.mu.RUnlock()
-	conn, ch, closed, channelClosed, confirms, err := openPublisher(amqpURL)
+	pub, err := openPublisher(b.dial, amqpURL)
 	if err != nil {
 		return err
 	}
 	b.mu.Lock()
-	b.publisherConn = conn
-	b.publisherCh = ch
-	b.publisherClosed = closed
-	b.publisherChannelClosed = channelClosed
-	b.publisherConfirms = confirms
+	b.publisherConn = pub.conn
+	b.publisherCh = pub.ch
+	b.publisherClosed = pub.closed
+	b.publisherChannelClosed = pub.channelClosed
+	b.publisherConfirms = pub.confirms
 	b.mu.Unlock()
 	if oldCh != nil {
 		_ = oldCh.Close()
@@ -814,16 +929,14 @@ func (b *RabbitBroker) discardPublisher() {
 func (b *RabbitBroker) Close() {
 	b.publishMu.Lock()
 	defer b.publishMu.Unlock()
-	if b.publisherCh != nil {
-		_ = b.publisherCh.Close()
+	b.discardPublisher()
+	b.mu.Lock()
+	ch, conn := b.ch, b.conn
+	b.mu.Unlock()
+	if ch != nil {
+		_ = ch.Close()
 	}
-	if b.publisherConn != nil {
-		_ = b.publisherConn.Close()
-	}
-	if b.ch != nil {
-		_ = b.ch.Close()
-	}
-	if b.conn != nil {
-		_ = b.conn.Close()
+	if conn != nil {
+		_ = conn.Close()
 	}
 }

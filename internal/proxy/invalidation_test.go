@@ -15,9 +15,9 @@ import (
 
 func TestHandlerInvalidateBookRemovesMatchingKeys(t *testing.T) {
 	c := cache.NewInMemoryCache(32, nil)
-	itemKey := "u|t|ru|book_view:42|"
+	itemKey := "u|t|ru|/books/42|"
 	_ = c.Set(context.Background(), cache.Item{Key: itemKey, Value: []byte("old"), StatusCode: http.StatusOK, ExpiresAt: time.Now().Add(time.Minute), Tags: []string{"book:42"}}, cache.Metrics{})
-	_ = c.Set(context.Background(), cache.Item{Key: "u|t|ru|category_view:fiction|", Value: []byte("category"), StatusCode: http.StatusOK, ExpiresAt: time.Now().Add(time.Minute), Tags: []string{"category:fiction"}}, cache.Metrics{})
+	_ = c.Set(context.Background(), cache.Item{Key: "u|t|ru|/categories/fiction|", Value: []byte("category"), StatusCode: http.StatusOK, ExpiresAt: time.Now().Add(time.Minute), Tags: []string{"category:fiction"}}, cache.Metrics{})
 
 	pf := prefetcher.NewAsyncPrefetcher(1, 8, 20*time.Millisecond, func(ctx context.Context, key string) error { return nil }, nil)
 	defer pf.Stop()
@@ -27,22 +27,22 @@ func TestHandlerInvalidateBookRemovesMatchingKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := h.HandleBookUpdated(context.Background(), events.BookUpdateEvent{BookID: "42", Version: 7, Type: "book.updated"}); err != nil {
+	if err := h.HandleEvent(context.Background(), events.Event{BookID: "42", Version: 7, Type: "book.updated"}); err != nil {
 		t.Fatal(err)
 	}
 
 	if _, err := c.Get(context.Background(), itemKey); err == nil {
 		t.Fatal("expected book-specific cache key to be invalidated")
 	}
-	if _, err := c.Get(context.Background(), "u|t|ru|category_view:fiction|"); err != nil {
+	if _, err := c.Get(context.Background(), "u|t|ru|/categories/fiction|"); err != nil {
 		t.Fatal("expected unrelated category key to remain")
 	}
 }
 
 func TestHandlerInvalidateBookUsesStructuredIDs(t *testing.T) {
 	c := cache.NewInMemoryCache(32, nil)
-	book1 := "u|t|ru|book_view:1|"
-	book10 := "u|t|ru|book_view:10|"
+	book1 := "u|t|ru|/books/1|"
+	book10 := "u|t|ru|/books/10|"
 	_ = c.Set(context.Background(), cache.Item{Key: book1, Value: []byte("one"), ExpiresAt: time.Now().Add(time.Minute), Tags: []string{"book:1"}}, cache.Metrics{})
 	_ = c.Set(context.Background(), cache.Item{Key: book10, Value: []byte("ten"), ExpiresAt: time.Now().Add(time.Minute), Tags: []string{"book:10"}}, cache.Metrics{})
 	h, err := NewHandler(c, predictor.NewMarkov(), noopPrefetcher{}, "http://example.com")
@@ -50,7 +50,7 @@ func TestHandlerInvalidateBookUsesStructuredIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := h.HandleBookUpdated(context.Background(), events.BookUpdateEvent{BookID: "1", Type: "book.updated"}); err != nil {
+	if err := h.HandleEvent(context.Background(), events.Event{BookID: "1", Type: "book.updated"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.Get(context.Background(), book1); err == nil {
@@ -63,8 +63,8 @@ func TestHandlerInvalidateBookUsesStructuredIDs(t *testing.T) {
 
 func TestHandlerBookInvalidationKeepsUnrelatedDerivedViews(t *testing.T) {
 	c := cache.NewInMemoryCache(32, nil)
-	detail := "u|t|ru|book_view:42|"
-	category := "u|t|ru|category_view:fiction|"
+	detail := "u|t|ru|/books/42|"
+	category := "u|t|ru|/categories/fiction|"
 	_ = c.Set(context.Background(), cache.Item{Key: detail, Value: []byte("detail"), ExpiresAt: time.Now().Add(time.Minute), Tags: []string{"book:42"}}, cache.Metrics{})
 	_ = c.Set(context.Background(), cache.Item{Key: category, Value: []byte("category"), ExpiresAt: time.Now().Add(time.Minute), Tags: []string{"category:fiction"}}, cache.Metrics{})
 	h, err := NewHandler(c, predictor.NewMarkov(), noopPrefetcher{}, "http://example.com")
@@ -72,7 +72,7 @@ func TestHandlerBookInvalidationKeepsUnrelatedDerivedViews(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := h.HandleBookUpdated(context.Background(), events.BookUpdateEvent{BookID: "42", Type: "book.updated"}); err != nil {
+	if err := h.HandleEvent(context.Background(), events.Event{BookID: "42", Type: "book.updated"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.Get(context.Background(), detail); err == nil {
@@ -118,7 +118,7 @@ func TestServeHTTPTagsStoredResponsesForInvalidation(t *testing.T) {
 	if c.Size() != 1 {
 		t.Fatalf("expected list to be cached, size=%d", c.Size())
 	}
-	if err := h.HandleBookUpdated(context.Background(), events.BookUpdateEvent{BookID: "7", Type: "book.updated"}); err != nil {
+	if err := h.HandleEvent(context.Background(), events.Event{BookID: "7", Type: "book.updated"}); err != nil {
 		t.Fatal(err)
 	}
 	if c.Size() != 0 {

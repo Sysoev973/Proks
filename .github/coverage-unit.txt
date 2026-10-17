@@ -1,0 +1,10 @@
+# Minimum statement coverage per package for `go test ./...` without
+# RabbitMQ or PostgreSQL. Raise a number when coverage grows; never lower one
+# to make CI pass.
+proks                          80
+proks/internal/proxy           85
+proks/internal/events          80
+proks/internal/cache           80
+proks/internal/predictor       80
+proks/internal/prefetcher      80
+proks/internal/observability   70

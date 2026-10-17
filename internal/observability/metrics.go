@@ -25,6 +25,7 @@ type Metrics struct {
 	upstreamErrors   *prometheus.CounterVec
 	prefetchExecuted prometheus.Counter
 	prefetchFailed   prometheus.Counter
+	invalidations    *prometheus.CounterVec
 }
 
 func NewMetrics() *Metrics {
@@ -92,8 +93,12 @@ func NewMetrics() *Metrics {
 			Name: "proxy_prefetch_failed_total",
 			Help: "Total prefetch jobs that failed (non-timeout error).",
 		}),
+		invalidations: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "proxy_invalidations_total",
+			Help: "Total invalidation targets applied, labeled by kind (tag or key).",
+		}, []string{"kind"}),
 	}
-	reg.MustRegister(m.hits, m.misses, m.bypasses, m.stale, m.collapsed, m.tooLarge, m.prefetches, m.latency, m.pollution, m.queueDepth, m.prefetchDropped, m.prefetchCanceled, m.upstreamErrors, m.prefetchExecuted, m.prefetchFailed)
+	reg.MustRegister(m.hits, m.misses, m.bypasses, m.stale, m.collapsed, m.tooLarge, m.prefetches, m.latency, m.pollution, m.queueDepth, m.prefetchDropped, m.prefetchCanceled, m.upstreamErrors, m.prefetchExecuted, m.prefetchFailed, m.invalidations)
 	return m
 }
 
@@ -165,4 +170,9 @@ func (m *Metrics) RecordCollapsed() {
 
 func (m *Metrics) RecordTooLarge() {
 	m.tooLarge.Inc()
+}
+
+func (m *Metrics) RecordInvalidation(tags, keys int) {
+	m.invalidations.WithLabelValues("tag").Add(float64(tags))
+	m.invalidations.WithLabelValues("key").Add(float64(keys))
 }

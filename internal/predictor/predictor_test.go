@@ -77,3 +77,44 @@ func TestEWMAImprovesPrefetchPrecision(t *testing.T) {
 		t.Fatalf("expected noisy route to be suppressed by EWMA, got %f", noiseAdjusted)
 	}
 }
+
+func TestPredictorEdgeCases(t *testing.T) {
+	m := NewMarkov()
+	m.Update("", "/b")
+	m.Update("/a", "")
+	if got := m.Predict("/a"); got != nil {
+		t.Fatalf("empty routes must be ignored, got %v", got)
+	}
+
+	e := NewEWMA(0)
+	if e.Add(1) != 1 || e.Value() != 1 {
+		t.Fatal("the first sample must initialize the average")
+	}
+	if got := e.Add(0); got != 0.7 {
+		t.Fatalf("invalid alpha must fall back to 0.3, got %v", got)
+	}
+
+	tracker := NewTrendTracker(0, 1, 0)
+	if tracker.Observe("", 1) != 0 || tracker.Confidence("") != 0 || tracker.ObserveOutcome("", true) != 0 {
+		t.Fatal("empty keys must be ignored")
+	}
+	if tracker.ObserveTransition("", "/b", true) != 0 {
+		t.Fatal("transitions need both ends")
+	}
+	tracker.ObserveTransition("/a", "/b", true)
+	if tracker.Confidence("/a->/b") != 1 {
+		t.Fatalf("expected full confidence after a success, got %v", tracker.Confidence("/a->/b"))
+	}
+	tracker.ObservePrefetch("/c", false)
+	if tracker.AdjustProbability("/c", 0.9) != 0 {
+		t.Fatal("a failed prefetch below the cutoff must suppress the route")
+	}
+	if tracker.AdjustProbability("/c", 0) != 0 {
+		t.Fatal("zero probability must stay zero")
+	}
+	tracker.Reset("/c")
+	tracker.Reset("")
+	if tracker.AdjustProbability("/c", 0.9) != 0.9 {
+		t.Fatal("a reset route must use the raw probability")
+	}
+}

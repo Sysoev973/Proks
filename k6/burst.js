@@ -1,6 +1,9 @@
 import http from 'k6/http';
 import { check } from 'k6';
 
+const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
+const P95_MS = Number(__ENV.P95_MS || 50);
+
 export const options = {
   scenarios: {
     burst: {
@@ -15,10 +18,14 @@ export const options = {
       ],
     },
   },
+  thresholds: {
+    http_req_failed: ['rate<0.01'],
+    http_req_duration: [`p(95)<${P95_MS}`],
+  },
 };
 
 export default function () {
-  const res = http.get('http://proxy:8080/books/1', {
+  const res = http.get(`${BASE_URL}/books/1`, {
     headers: {
       'X-User-ID': `user-${__VU}`,
       'X-Tenant': 'acme',

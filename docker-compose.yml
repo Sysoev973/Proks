@@ -38,6 +38,10 @@ services:
     environment:
       DB_DSN: "postgres://library_user:library_password@postgres:5432/library_db?sslmode=disable"
       LISTEN_ADDR: ":8081"
+      # PUT /books/{id} asks the proxy to purge what it changed; the proxy
+      # fans the purge out to every replica through RabbitMQ.
+      INVALIDATION_URL: "http://proxy:8080/admin/purge"
+      INVALIDATION_TOKEN: "${ADMIN_TOKEN:-dev-admin-token}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -65,8 +69,12 @@ services:
       RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
       RABBITMQ_REQUIRED: "true"
       ADMIN_TOKEN: "${ADMIN_TOKEN:-dev-admin-token}"
+      ROUTES_CONFIG: "/etc/proks/routes.yaml"
+      PREFETCH_ENABLED: "true"
+      LOG_LEVEL: "info"
     volumes:
       - proxy-events:/var/lib/proks/events
+      - ./routes.example.yaml:/etc/proks/routes.yaml:ro
     depends_on:
       upstream:
         condition: service_healthy
@@ -89,6 +97,7 @@ services:
       PROXY_REPLICA_ID: "proxy-2"
     volumes:
       - proxy-2-events:/var/lib/proks/events
+      - ./routes.example.yaml:/etc/proks/routes.yaml:ro
 
   prometheus:
     image: prom/prometheus:v2.54.1
@@ -112,16 +121,21 @@ services:
     depends_on:
       - prometheus
 
+  # Load tests run on demand, not on every `docker compose up`:
+  #   docker compose --profile load run --rm k6 run /scripts/burst.js
   k6:
     image: grafana/k6:latest
+    profiles: ["load"]
     depends_on:
       proxy:
         condition: service_healthy
     environment:
+      BASE_URL: "http://proxy:8080"
       ADMIN_TOKEN: "${ADMIN_TOKEN:-dev-admin-token}"
     volumes:
-      - ./k6:/scripts
-    entrypoint: ["sh", "-c", "sleep 15; k6 run /scripts/read-heavy.js --vus 10 --duration 30s"]
+      - ./k6:/scripts:ro
+    entrypoint: ["k6"]
+    command: ["run", "/scripts/read-heavy.js"]
 
 volumes:
   pgdata:
