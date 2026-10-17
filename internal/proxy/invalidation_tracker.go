@@ -5,16 +5,6 @@ import (
 	"time"
 )
 
-// invalidationTracker closes the race between an upstream fetch and a purge:
-// a response read before an invalidation of one of its tags must not be stored
-// after the purge already ran.
-//
-// Each invalidation takes the next value of a global sequence and records it
-// on the tag. A fetch remembers the sequence before it goes upstream and, once
-// it knows the response's tags (some only arrive in X-Cache-Depends-On),
-// refuses to store if any of them was invalidated since. The check and the
-// Set run under the read lock and the invalidation bumps under the write lock,
-// so a purge either happens before the check or finds the stored item.
 type invalidationTracker struct {
 	mu   sync.RWMutex
 	seq  uint64
@@ -22,19 +12,13 @@ type invalidationTracker struct {
 }
 
 type tagInvalidation struct {
-	// seq is the latest invalidation of the tag, version its event version.
-	seq     uint64
-	version int64
-	// unconditionalSeq is the latest invalidation without a version, which
-	// purges regardless of the response version.
+	seq              uint64
+	version          int64
 	unconditionalSeq uint64
 	at               time.Time
 }
 
 const (
-	// invalidationRetention bounds how long a tag's invalidation is remembered.
-	// A fetch that started earlier than this is never stored, so forgetting an
-	// older entry cannot let stale data in.
 	invalidationRetention = time.Minute
 	invalidationPruneSize = 4096
 )
@@ -76,9 +60,6 @@ func (t *invalidationTracker) invalidate(tag string, version int64) {
 	}
 }
 
-// storeIfCurrent runs store while holding off invalidations, unless one of
-// tags was invalidated after token was taken. A response carrying a version
-// newer than a versioned invalidation is still stored.
 func (t *invalidationTracker) storeIfCurrent(token fetchToken, tags []string, responseVersion int64, store func() bool) (stored, invalidated bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
