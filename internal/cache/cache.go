@@ -69,8 +69,18 @@ type Metrics struct {
 	VictimFrequency    uint32
 	CurrentSize        int
 	VictimKey          string
+	// NoEviction is set by Set when the item fits without evicting anything;
+	// admission then has nobody to protect.
+	NoEviction bool
 }
 
+// Cache is the storage the proxy handler works against. InMemoryCache is the
+// only implementation today; a shared L2 (Redis) or a peer cache (groupcache
+// style) can be added by implementing this interface, without changes to the
+// handler. The handler only uses InMemoryCache-specific features (TinyLFU
+// admission counters, VictimFor) through optional type assertions and skips
+// them for other stores. KeysForTag must cover every key stored with that
+// tag, since invalidation deletes exactly those keys.
 type Cache interface {
 	Get(ctx context.Context, key string) (Item, error)
 	Lookup(ctx context.Context, key string) (item Item, fresh bool, err error)
@@ -82,6 +92,11 @@ type Cache interface {
 	Capacity() int
 	Bytes() int64
 }
+
+// Store is the name the architecture docs use for Cache.
+type Store = Cache
+
+var _ Store = (*InMemoryCache)(nil)
 
 type AdmissionPolicy interface {
 	ShouldStore(item Item, metrics Metrics) bool
@@ -191,7 +206,11 @@ func NewTinyLFURuntimeCache(capacity int, maxBytes int64) *InMemoryCache {
 	if capacity <= 0 {
 		capacity = 1024
 	}
-	filter := NewTinyLFU()
+	width := defaultCountMinWidth
+	for width < capacity {
+		width *= 2
+	}
+	filter := NewTinyLFUSized(width, uint64(10*capacity))
 	window := NewLRUWindow(32)
 	admission := NewTinyLFUAdmission(filter, window, 2, 0.7)
 	return New(Config{Capacity: capacity, MaxBytes: maxBytes, Admission: admission})
@@ -252,7 +271,8 @@ func (c *InMemoryCache) Set(_ context.Context, item Item, metrics Metrics) bool 
 	defer s.mu.Unlock()
 
 	existing := s.items[item.Key]
-	if s.wouldOverflowLocked(size, existing) {
+	metrics.NoEviction = !s.wouldOverflowLocked(size, existing)
+	if !metrics.NoEviction {
 		if back := s.lru.Back(); back != nil {
 			if victimKey, ok := back.Value.(string); ok && victimKey != item.Key {
 				if fa, ok := c.admission.(frequencyAwareAdmission); ok {

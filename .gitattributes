@@ -1,0 +1,2 @@
+# Go files are LF everywhere: gofmt (and CI) treat CRLF as unformatted.
+*.go text eol=lf

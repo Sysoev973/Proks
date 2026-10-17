@@ -1,0 +1,3 @@
+# Minimum statement coverage with RabbitMQ and PostgreSQL available.
+proks/internal/events          80
+proks/cmd/upstream             60

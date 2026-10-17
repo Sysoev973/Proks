@@ -127,6 +127,18 @@ func NewTinyLFU() *TinyLFU {
 	return &TinyLFU{sketch: NewCountMinSketch(defaultCountMinWidth, defaultCountMinDepth)}
 }
 
+// NewTinyLFUSized returns a filter with width counters per row that halves
+// all counts every sampleSize increments. A width close to the number of
+// cached keys keeps collisions rare; a sample of about ten times the cache
+// size lets old popularity fade without forgetting the hot set.
+func NewTinyLFUSized(width int, sampleSize uint64) *TinyLFU {
+	sketch := NewCountMinSketch(width, defaultCountMinDepth)
+	if sampleSize > 0 {
+		sketch.agingStep = sampleSize
+	}
+	return &TinyLFU{sketch: sketch}
+}
+
 func (t *TinyLFU) Increment(key string) {
 	if key == "" {
 		return
@@ -193,9 +205,11 @@ func (a *TinyLFUAdmission) ShouldStore(item Item, metrics Metrics) bool {
 	if item.Key == "" {
 		return false
 	}
-	if a == nil {
+	if a == nil || metrics.NoEviction {
 		return true
 	}
+	// A key seen recently (before this miss) is admitted, so a new key needs
+	// two requests within the window to push out an established one.
 	if a.Window != nil && a.Window.Contains(item.Key) {
 		return true
 	}

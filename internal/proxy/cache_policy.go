@@ -27,6 +27,8 @@ type CachePolicy struct {
 	AllowStreaming        bool
 	TrustForwardedHeaders bool
 	MaxBodySize           int64
+	// Routes give responses invalidation tags by path template; see Route.
+	Routes []Route
 }
 
 type StatusRange struct {
@@ -240,19 +242,23 @@ func fingerprint(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func buildPolicyCacheKey(r *http.Request, p CachePolicy) string {
-	return buildPolicyCacheKeyForRoute(r, normalizeRouteKey(r), p)
+// requestKeyHeaders are the request headers that are always part of the
+// cache key, in key order.
+var requestKeyHeaders = []string{"X-User-ID", "X-Tenant", "X-Locale"}
+
+// keyHeaders lists every request header that can change the cache key.
+func (p CachePolicy) keyHeaders() []string {
+	names := append([]string(nil), requestKeyHeaders...)
+	names = append(names, p.VaryHeaders...)
+	return append(names, p.Dimensions...)
 }
 
-func buildPolicyCacheKeyForRoute(r *http.Request, route string, p CachePolicy) string {
-	query := normalizeQuery(r.URL.Query())
-	parts := []string{
-		r.Header.Get("X-User-ID"),
-		r.Header.Get("X-Tenant"),
-		r.Header.Get("X-Locale"),
-		route,
-		query,
+func buildPolicyCacheKey(r *http.Request, p CachePolicy) string {
+	parts := make([]string, 0, len(requestKeyHeaders)+2+len(p.VaryHeaders)+len(p.Dimensions))
+	for _, name := range requestKeyHeaders {
+		parts = append(parts, r.Header.Get(name))
 	}
+	parts = append(parts, routeKey(r.URL.Path), normalizeQuery(r.URL.Query()))
 	if r.Method != http.MethodGet {
 		parts = append([]string{strings.ToUpper(r.Method)}, parts...)
 	}

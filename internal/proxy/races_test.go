@@ -99,10 +99,7 @@ func TestPurgeDuringFetchIsNotLost(t *testing.T) {
 			}))
 			defer upstream.Close()
 			c := cache.NewInMemoryCache(32, nil)
-			h, err := NewHandler(c, predictor.NewMarkov(), noopPrefetcher{}, upstream.URL)
-			if err != nil {
-				t.Fatal(err)
-			}
+			h := newRoutedHandler(t, c, noopPrefetcher{}, upstream.URL)
 
 			done := make(chan *httptest.ResponseRecorder)
 			go func() {
@@ -111,7 +108,7 @@ func TestPurgeDuringFetchIsNotLost(t *testing.T) {
 				done <- rec
 			}()
 			waitFor(t, func() bool { return calls.Load() == 1 })
-			if err := h.HandleBookUpdated(context.Background(), events.BookUpdateEvent{Type: "book.updated", BookID: "1", Version: tc.eventVersion}); err != nil {
+			if err := h.HandleEvent(context.Background(), events.Event{Type: "book.updated", BookID: "1", Version: tc.eventVersion}); err != nil {
 				t.Fatal(err)
 			}
 			close(release)
@@ -142,7 +139,7 @@ func TestPurgeOfUnrelatedTagDoesNotBlockStore(t *testing.T) {
 		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/books/1", nil))
 	}()
 	waitFor(t, func() bool { return calls.Load() == 1 })
-	_ = h.HandleBookUpdated(context.Background(), events.BookUpdateEvent{Type: "book.updated", BookID: "2"})
+	_ = h.HandleEvent(context.Background(), events.Event{Type: "book.updated", BookID: "2"})
 	close(release)
 	<-done
 	if c.Size() != 1 {

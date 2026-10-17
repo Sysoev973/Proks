@@ -32,18 +32,18 @@ func TestEventLogCompactionKeepsOnlyPendingEvents(t *testing.T) {
 		maxVersion:   make(map[string]int64),
 	}
 	for i := 0; i < eventLogCompactEvery-2; i++ {
-		evt := BookUpdateEvent{EventID: fmt.Sprintf("done-%d", i), Type: "book.updated", BookID: "1"}
+		evt := Event{EventID: fmt.Sprintf("done-%d", i), Type: "book.updated", BookID: "1"}
 		if err := b.appendEvent(evt); err != nil {
 			t.Fatal(err)
 		}
 		b.rememberLocked(evt.EventID)
 	}
-	b.maxVersion["2"] = 5
-	if err := b.appendEvent(BookUpdateEvent{EventID: "old-version", Type: "book.updated", BookID: "2", Version: 4}); err != nil {
+	b.maxVersion["book:2"] = 5
+	if err := b.appendEvent(Event{EventID: "old-version", Type: "book.updated", BookID: "2", Version: 4}); err != nil {
 		t.Fatal(err)
 	}
 	// The 1000th append compacts; this event is still pending, so it stays.
-	if err := b.appendEvent(BookUpdateEvent{EventID: "pending", Type: "book.updated", BookID: "3", Version: 1}); err != nil {
+	if err := b.appendEvent(Event{EventID: "pending", Type: "book.updated", BookID: "3", Version: 1}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -77,7 +77,7 @@ func TestEveryReplicaReceivesEachEvent(t *testing.T) {
 		t.Skip("RABBITMQ_TEST_URL is not set")
 	}
 	run := fmt.Sprintf("%d", time.Now().UnixNano())
-	newReplica := func(name string) (*RabbitBroker, chan BookUpdateEvent) {
+	newReplica := func(name string) (*RabbitBroker, chan Event) {
 		dir := t.TempDir()
 		t.Setenv("PROXY_REPLICA_ID", name+"-"+run)
 		t.Setenv("EVENT_LOG_PATH", filepath.Join(dir, "events.log"))
@@ -88,8 +88,8 @@ func TestEveryReplicaReceivesEachEvent(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(b.Close)
-		got := make(chan BookUpdateEvent, 1)
-		stop, err := b.Subscribe(context.Background(), func(_ context.Context, evt BookUpdateEvent) error {
+		got := make(chan Event, 1)
+		stop, err := b.Subscribe(context.Background(), func(_ context.Context, evt Event) error {
 			got <- evt
 			return nil
 		})
@@ -103,13 +103,13 @@ func TestEveryReplicaReceivesEachEvent(t *testing.T) {
 	_, gotSecond := newReplica("b")
 	time.Sleep(time.Second) // consumers declare and bind their queues asynchronously
 
-	if err := first.Publish(context.Background(), BookUpdateEvent{Type: "book.updated", BookID: "42", Version: 1}); err != nil {
+	if err := first.Publish(context.Background(), Event{Type: TypeInvalidate, Tags: []string{"order:42"}, Version: 1}); err != nil {
 		t.Fatal(err)
 	}
-	for name, ch := range map[string]chan BookUpdateEvent{"a": gotFirst, "b": gotSecond} {
+	for name, ch := range map[string]chan Event{"a": gotFirst, "b": gotSecond} {
 		select {
 		case evt := <-ch:
-			if evt.BookID != "42" {
+			if len(evt.Tags) != 1 || evt.Tags[0] != "order:42" {
 				t.Fatalf("replica %s got wrong event %+v", name, evt)
 			}
 		case <-time.After(5 * time.Second):

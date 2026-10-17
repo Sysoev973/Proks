@@ -10,10 +10,12 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"proks/internal/cache"
@@ -48,8 +50,6 @@ func isStreamingResponse(resp *http.Response) bool {
 	if resp == nil {
 		return false
 	}
-	// Chunked bodies of unknown length are ordinary responses (net/http chunks
-	// anything over ~2KB); they are buffered under MaxBodySize like the rest.
 	return strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
 }
 
@@ -68,6 +68,12 @@ type Handler struct {
 	policy            CachePolicy
 	inflight          singleflight.Group
 	invalidations     *invalidationTracker
+	routes            routeTable
+
+	prefetchMu          sync.Mutex
+	prefetchRequests    map[string]prefetchRequest
+	prefetchLimiter     *rateLimiter
+	prefetchPausedUntil atomic.Int64
 }
 
 type upstreamResponse struct {
@@ -86,6 +92,10 @@ func NewHandlerWithPolicy(cache cache.Cache, pred predictor.Predictor, pf prefet
 	if err != nil {
 		return nil, err
 	}
+	routes, err := compileRoutes(policy.Routes)
+	if err != nil {
+		return nil, err
+	}
 	h := &Handler{
 		cache:             cache,
 		predictor:         pred,
@@ -97,6 +107,8 @@ func NewHandlerWithPolicy(cache cache.Cache, pred predictor.Predictor, pf prefet
 		metrics:           observability.NewMetrics(),
 		policy:            policy.normalized(),
 		invalidations:     newInvalidationTracker(),
+		routes:            routes,
+		prefetchLimiter:   newRateLimiter(defaultPrefetchRPS),
 		httpClient: &http.Client{
 			Timeout: 2 * time.Second,
 			Transport: &http.Transport{
@@ -138,20 +150,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if h.metrics != nil {
 			h.metrics.RecordRequest(status, reason, time.Since(start))
 		}
-		slog.Info("cache_decision",
-			"request_id", requestIDFromContext(ctx),
-			"key", key,
-			"status", status,
-			"reason", reason,
-			"duration_ms", time.Since(start).Milliseconds(),
-		)
+		if slog.Default().Enabled(ctx, slog.LevelDebug) {
+			slog.Debug("cache_decision",
+				"request_id", requestIDFromContext(ctx),
+				"key", key,
+				"status", status,
+				"reason", reason,
+				"duration", time.Since(start),
+			)
+		}
 	}()
 
 	var staleItem *cache.Item
 	if decision.Allowed {
 		if item, fresh, err := h.cache.Lookup(ctx, key); err == nil {
 			h.recordAccess(key)
-			current := normalizeRouteKey(r)
+			current := routeKey(r.URL.Path)
 			h.recordTransition(r, current)
 			if fresh {
 				if h.consumePrefetchSignal(key) {
@@ -185,12 +199,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if follower && h.metrics != nil {
 		h.metrics.RecordCollapsed()
 	}
-	if err != nil && h.metrics != nil {
-		kind := "other"
-		if errors.Is(err, context.DeadlineExceeded) {
-			kind = "timeout"
+	if err != nil && !errors.Is(err, context.Canceled) {
+		h.pausePrefetch()
+		if h.metrics != nil {
+			kind := "other"
+			if errors.Is(err, context.DeadlineExceeded) {
+				kind = "timeout"
+			}
+			h.metrics.RecordUpstreamError(kind)
 		}
-		h.metrics.RecordUpstreamError(kind)
+	} else if err == nil && upstream.status >= http.StatusInternalServerError {
+		h.pausePrefetch()
 	}
 	if staleItem != nil && (err != nil || upstream.status >= http.StatusInternalServerError) {
 		status = string(cache.StatusStale)
@@ -268,7 +287,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(code)
 	_, _ = w.Write(respBytes)
 
-	current := normalizeRouteKey(r)
+	current := routeKey(r.URL.Path)
 	h.recordTransition(r, current)
 	if decision.Allowed {
 		h.maybePrefetchForRequest(ctx, r, current)
@@ -317,9 +336,6 @@ func (h *Handler) fetch(ctx context.Context, r *http.Request, key string, cachea
 		if ran || out.Err != nil || res.stored {
 			return res, !ran, out.Err
 		}
-		// The leader's response was not cacheable (Set-Cookie, private,
-		// no-store, ...), so it may be personal to the leader's client. Like
-		// Varnish's hit-for-miss, the follower fetches its own response.
 		res, err = h.fetchAndStore(ctx, r, key, false)
 		return res, false, err
 	}
@@ -370,7 +386,7 @@ func (h *Handler) fetchAndStore(ctx context.Context, r *http.Request, key string
 		ExpiresAt:  expiresAt,
 		StaleUntil: expiresAt.Add(max(swr, sie)),
 		Version:    versionFromResponse(upstream.headers),
-		Tags:       resourcesForRequest(r, upstream.headers),
+		Tags:       h.routes.tagsForResponse(r, upstream.headers),
 	}
 	if limited, ok := h.cache.(interface{ MaxItemBytes() int64 }); ok {
 		if limit := limited.MaxItemBytes(); limit > 0 && cache.ItemSize(item) > limit {
@@ -381,10 +397,13 @@ func (h *Handler) fetchAndStore(ctx context.Context, r *http.Request, key string
 			return res, nil
 		}
 	}
+	h.recordFrequency(key)
 	metrics := h.computeMetrics(key)
-	h.recordAccess(key)
+	// The window is touched after the store: a key enters it on its first
+	// miss and is admitted over an established key only on the next one.
+	defer h.touchWindow(key)
 	var invalidated bool
-	res.stored, invalidated = h.invalidations.storeIfCurrent(token, item.Tags, item.Version, func() bool {
+	res.stored, invalidated = h.invalidations.storeIfCurrent(token, append(slices.Clip(item.Tags), keyTag(key)), item.Version, func() bool {
 		return h.cache.Set(ctx, item, metrics)
 	})
 	if invalidated {
@@ -392,13 +411,6 @@ func (h *Handler) fetchAndStore(ctx context.Context, r *http.Request, key string
 	}
 	res.pollution = metrics.Pollution
 	return res, nil
-}
-
-func (h *Handler) InvalidateBook(ctx context.Context, key string) {
-	if key == "" || h.cache == nil {
-		return
-	}
-	h.invalidateResource(ctx, "book:"+key, 0)
 }
 
 func (h *Handler) invalidateResource(ctx context.Context, resourceID string, version int64) {
@@ -411,6 +423,15 @@ func (h *Handler) invalidateResource(ctx context.Context, resourceID string, ver
 			h.cache.Delete(ctx, key)
 		}
 	}
+}
+
+func keyTag(key string) string {
+	return "\x00key:" + key
+}
+
+func (h *Handler) invalidateKey(ctx context.Context, key string) {
+	h.invalidations.invalidate(keyTag(key), 0)
+	h.cache.Delete(ctx, key)
 }
 
 func requestIDFromContext(ctx context.Context) string {
@@ -447,36 +468,55 @@ func (h *Handler) StartEventConsumer(ctx context.Context) error {
 	if h.eventStream == nil {
 		return nil
 	}
-	_, err := h.eventStream.Subscribe(ctx, h.HandleBookUpdated)
+	_, err := h.eventStream.Subscribe(ctx, h.HandleEvent)
 	return err
 }
 
-func (h *Handler) HandleBookUpdated(ctx context.Context, event events.BookUpdateEvent) error {
-	if err := events.ValidateBookUpdateEvent(event); err != nil {
+// HandleEvent applies an invalidation: every cached response carrying one of
+// the event's tags (unless it is newer than the event's version) and every
+func (h *Handler) HandleEvent(ctx context.Context, event events.Event) error {
+	event, err := events.Normalize(event)
+	if err != nil {
 		return err
 	}
 	if h.cache == nil {
 		return nil
 	}
-
-	h.invalidateResource(ctx, "book:"+event.BookID, event.Version)
-
+	for _, tag := range event.Tags {
+		h.invalidateResource(ctx, tag, event.Version)
+	}
+	for _, key := range event.Keys {
+		h.invalidateKey(ctx, key)
+	}
 	if h.metrics != nil {
-		h.metrics.RecordRequest("MISS", "INVALIDATED", 0)
+		h.metrics.RecordInvalidation(len(event.Tags), len(event.Keys))
 	}
 	return nil
 }
 
 func (h *Handler) recordAccess(key string) {
+	h.recordFrequency(key)
+	h.touchWindow(key)
+}
+
+func (h *Handler) tinyLFU() *cache.TinyLFUAdmission {
 	if c, ok := h.cache.(*cache.InMemoryCache); ok {
 		if adm, ok := c.Admission().(*cache.TinyLFUAdmission); ok {
-			if adm.Filter != nil {
-				adm.Filter.Increment(key)
-			}
-			if adm.Window != nil {
-				adm.Window.Touch(key)
-			}
+			return adm
 		}
+	}
+	return nil
+}
+
+func (h *Handler) recordFrequency(key string) {
+	if adm := h.tinyLFU(); adm != nil && adm.Filter != nil {
+		adm.Filter.Increment(key)
+	}
+}
+
+func (h *Handler) touchWindow(key string) {
+	if adm := h.tinyLFU(); adm != nil && adm.Window != nil {
+		adm.Window.Touch(key)
 	}
 }
 
@@ -493,7 +533,6 @@ func (h *Handler) recordTrend(key string, success bool) {
 
 // MarkPrefetched records that key was loaded into the cache by a successful
 // prefetch, so the next HIT for it is reported as PREFETCH. Call it only after
-// the prefetch fetch has stored the item.
 func (h *Handler) MarkPrefetched(key string) {
 	if key == "" {
 		return
@@ -562,10 +601,6 @@ func (h *Handler) computeMetrics(key string) cache.Metrics {
 	return metrics
 }
 
-func (h *Handler) maybePrefetch(_ context.Context, current string) {
-	h.maybePrefetchForRequest(nil, nil, current)
-}
-
 func (h *Handler) recordTransition(r *http.Request, current string) {
 	if r == nil || current == "" {
 		return
@@ -609,23 +644,18 @@ func normalizeRouteKeyFromString(s string) string {
 	if s == "" {
 		return ""
 	}
-	if strings.HasPrefix(s, "book_view:") || strings.HasPrefix(s, "category_view:") || strings.HasPrefix(s, "root") {
-		return s
+	if u, err := url.Parse(s); err == nil {
+		s = u.Path
 	}
-	if strings.Contains(s, "http") {
-		if u, err := url.Parse(s); err == nil {
-			s = u.Path
-		}
-	}
-	trimmed := strings.Trim(s, "/")
-	if trimmed == "" {
-		return "root"
-	}
-	return normalizeRouteKey(&http.Request{URL: &url.URL{Path: "/" + trimmed}})
+	return routeKey(s)
 }
 
+// maybePrefetchForRequest queues the most likely next route after r for
+// prefetching when the predictor is confident enough. The queued key is the
+// cache key a client would hit for that route; the request template is kept
+// for Prefetch.
 func (h *Handler) maybePrefetchForRequest(ctx context.Context, r *http.Request, current string) {
-	if current == "" {
+	if current == "" || r == nil {
 		return
 	}
 	cacheCtx := context.Background()
@@ -641,9 +671,12 @@ func (h *Handler) maybePrefetchForRequest(ctx context.Context, r *http.Request, 
 	if adjustedProbability < h.prefetchThreshold {
 		return
 	}
-	prefetchKey := top.Key
-	if r != nil {
-		prefetchKey = buildPolicyCacheKeyForRoute(r, top.Key, h.policy)
+	if pf, ok := h.prefetcher.(interface{ Enabled() bool }); ok && !pf.Enabled() {
+		return
+	}
+	prefetchReq, prefetchKey, ok := h.prefetchTemplate(r, top.Key)
+	if !ok {
+		return
 	}
 	if _, err := h.cache.Get(cacheCtx, prefetchKey); err == nil {
 		return
@@ -651,9 +684,7 @@ func (h *Handler) maybePrefetchForRequest(ctx context.Context, r *http.Request, 
 	if h.cacheIsPolluted(prefetchKey) {
 		return
 	}
-	if pf, ok := h.prefetcher.(interface{ Enabled() bool }); ok && !pf.Enabled() {
-		return
-	}
+	h.rememberPrefetchRequest(prefetchKey, prefetchReq)
 	prefetchCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	// The key is marked as prefetched only by MarkPrefetched, once the load has
@@ -702,28 +733,6 @@ func BuildCacheKey(r *http.Request) string {
 		return ""
 	}
 	return buildPolicyCacheKey(r, DefaultCachePolicy())
-}
-
-func buildScopedCacheKey(r *http.Request, route string) string {
-	if r == nil {
-		return route
-	}
-	return buildPolicyCacheKeyForRoute(r, route, DefaultCachePolicy())
-}
-
-func normalizeRouteKey(r *http.Request) string {
-	path := strings.Trim(r.URL.Path, "/")
-	parts := strings.Split(path, "/")
-	if len(parts) >= 2 && parts[0] == "books" {
-		return "book_view:" + parts[1]
-	}
-	if len(parts) >= 2 && parts[0] == "categories" {
-		return "category_view:" + parts[1]
-	}
-	if path == "" {
-		return "root"
-	}
-	return strings.ReplaceAll(path, "/", ":")
 }
 
 func normalizeQuery(v url.Values) string {
@@ -930,52 +939,4 @@ func appendForwarded(headers http.Header, name, value string) {
 
 func (h *Handler) Metrics() *observability.Metrics {
 	return h.metrics
-}
-
-func resourcesForRequest(r *http.Request, headers http.Header) []string {
-	if r == nil {
-		return nil
-	}
-	path := strings.Trim(r.URL.Path, "/")
-	parts := strings.Split(path, "/")
-	var resources []string
-	if len(parts) >= 2 && parts[0] == "books" {
-		resources = append(resources, "book:"+parts[1])
-	} else if len(parts) == 1 && parts[0] == "books" {
-		resources = append(resources, "list:books")
-	}
-	if len(parts) >= 2 && parts[0] == "categories" {
-		resources = append(resources, "category:"+parts[1])
-	}
-	if query := r.URL.Query().Get("q"); query != "" {
-		resources = append(resources, "search:"+strings.ToLower(strings.TrimSpace(query)))
-	}
-	for _, dependency := range strings.Split(headers.Get("X-Cache-Depends-On"), ",") {
-		dependency = strings.TrimSpace(dependency)
-		if strings.HasPrefix(dependency, "book:") || strings.HasPrefix(dependency, "category:") ||
-			strings.HasPrefix(dependency, "list:") || strings.HasPrefix(dependency, "search:") ||
-			strings.HasPrefix(dependency, "aggregate:") {
-			resources = append(resources, dependency)
-		}
-	}
-	return resources
-}
-
-func extractBookIDFromRoute(s string) string {
-	if idx := strings.Index(s, "book_view:"); idx != -1 {
-		rest := s[idx+len("book_view:"):]
-		if end := strings.IndexAny(rest, "|/"); end != -1 {
-			return rest[:end]
-		}
-
-		return rest
-	}
-	if idx := strings.Index(s, "/books/"); idx != -1 {
-		rest := s[idx+len("/books/"):]
-		if end := strings.IndexAny(rest, "|/?"); end != -1 {
-			return rest[:end]
-		}
-		return rest
-	}
-	return ""
 }

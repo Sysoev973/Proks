@@ -1,7 +1,12 @@
 package prefetcher
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"log"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -80,5 +85,102 @@ func TestAsyncPrefetcherWithoutLoaderRecordsNothing(t *testing.T) {
 	}
 	if snap := p.Snapshot(); snap != (Stats{}) {
 		t.Fatalf("expected zero stats, got %+v", snap)
+	}
+}
+
+type outcome struct {
+	key     string
+	success bool
+}
+
+func newObserved(t *testing.T, fetch FetchFunc, logs *bytes.Buffer) (*AsyncPrefetcher, chan outcome) {
+	t.Helper()
+	var logger *log.Logger
+	if logs != nil {
+		logger = log.New(logs, "", 0)
+	}
+	p := NewAsyncPrefetcher(1, 4, time.Second, fetch, logger)
+	t.Cleanup(p.Stop)
+	outcomes := make(chan outcome, 4)
+	p.SetOutcomeHook(func(key string, success bool) { outcomes <- outcome{key, success} })
+	return p, outcomes
+}
+
+func waitOutcome(t *testing.T, outcomes chan outcome) outcome {
+	t.Helper()
+	select {
+	case o := <-outcomes:
+		return o
+	case <-time.After(5 * time.Second):
+		t.Fatal("no prefetch outcome")
+		return outcome{}
+	}
+}
+
+func TestAsyncPrefetcherReportsOutcomes(t *testing.T) {
+	var logs bytes.Buffer
+	results := map[string]error{
+		"ok":       nil,
+		"failed":   errors.New("upstream down"),
+		"canceled": context.DeadlineExceeded,
+	}
+	p, outcomes := newObserved(t, func(_ context.Context, key string) error { return results[key] }, &logs)
+
+	for _, key := range []string{"ok", "failed", "canceled"} {
+		p.Enqueue(context.Background(), key, ReasonMarkov)
+		got := waitOutcome(t, outcomes)
+		if got.key != key || got.success != (results[key] == nil) {
+			t.Fatalf("%s: unexpected outcome %+v", key, got)
+		}
+	}
+	waitFor := func(cond func(Stats) bool) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for !cond(p.Snapshot()) {
+			if time.Now().After(deadline) {
+				t.Fatalf("unexpected stats %+v", p.Snapshot())
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	waitFor(func(s Stats) bool { return s.Enqueued == 3 && s.Executed == 1 && s.Failed == 1 && s.Canceled == 1 })
+	p.Stop() // waits for the worker, which logs after reporting the outcome
+	if !strings.Contains(logs.String(), "prefetch failed key=failed") || !strings.Contains(logs.String(), "prefetch canceled key=canceled") {
+		t.Fatalf("expected failures to be logged, got %q", logs.String())
+	}
+}
+
+func TestAsyncPrefetcherDropsWhenClosedOrCanceled(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	p, _ := newObserved(t, func(context.Context, string) error {
+		started <- struct{}{}
+		<-release
+		return nil
+	}, nil)
+	defer close(release)
+
+	p.Enqueue(context.Background(), "", ReasonMarkov)
+	p.Enqueue(context.Background(), "running", ReasonMarkov)
+	<-started
+	for i := 0; i < 4; i++ {
+		p.Enqueue(context.Background(), "queued-"+strconv.Itoa(i), ReasonMarkov)
+	}
+	if p.QueueDepth() != 4 {
+		t.Fatalf("expected a full queue of 4, got %d", p.QueueDepth())
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	p.Enqueue(ctx, "late", ReasonMarkov)
+	if got := p.Snapshot(); got.Enqueued != 5 || got.Dropped != 1 {
+		t.Fatalf("expected the canceled enqueue to be dropped, got %+v", got)
+	}
+
+	closed := NewAsyncPrefetcher(0, 0, 0, func(context.Context, string) error { return nil }, nil)
+	closed.Stop()
+	closed.Stop()
+	closed.Enqueue(context.Background(), "after-stop", ReasonMarkov)
+	if got := closed.Snapshot().Dropped; got != 1 {
+		t.Fatalf("expected an enqueue after Stop to be dropped, got %d", got)
 	}
 }
