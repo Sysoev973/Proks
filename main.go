@@ -52,6 +52,8 @@ type Config struct {
 
 	CacheCapacity        uint64
 	CacheMaxBytes        uint64
+	CacheTTL             time.Duration
+	CacheMaxTTL          time.Duration
 	StaleWhileRevalidate time.Duration
 	StaleIfError         time.Duration
 	Routes               []proxy.Route
@@ -168,6 +170,8 @@ func loadConfig(getenv func(string) string) (Config, error) {
 		AdminToken:           e.string("ADMIN_TOKEN", ""),
 		CacheCapacity:        e.uint("CACHE_CAPACITY", 10_000),
 		CacheMaxBytes:        e.uint("CACHE_MAX_BYTES", 256<<20),
+		CacheTTL:             e.duration("CACHE_TTL", 5*time.Minute),
+		CacheMaxTTL:          e.duration("CACHE_MAX_TTL", 0),
 		StaleWhileRevalidate: e.duration("CACHE_STALE_WHILE_REVALIDATE", 10*time.Second),
 		StaleIfError:         e.duration("CACHE_STALE_IF_ERROR", 5*time.Minute),
 		EWMAAlpha:            e.float("EWMA_ALPHA", 0.35),
@@ -193,6 +197,9 @@ func loadConfig(getenv func(string) string) (Config, error) {
 	}
 	if cfg.CacheCapacity == 0 {
 		e.errs = append(e.errs, errors.New("CACHE_CAPACITY must be positive"))
+	}
+	if cfg.CacheTTL == 0 {
+		e.errs = append(e.errs, errors.New("CACHE_TTL must be positive"))
 	}
 	return cfg, errors.Join(e.errs...)
 }
@@ -224,6 +231,8 @@ func run(ctx context.Context, cfg Config) error {
 	defer pf.Stop()
 
 	policy := proxy.DefaultCachePolicy()
+	policy.SuccessTTL = cfg.CacheTTL
+	policy.MaxTTL = cfg.CacheMaxTTL
 	policy.StaleWhileRevalidate = cfg.StaleWhileRevalidate
 	policy.StaleIfError = cfg.StaleIfError
 	policy.Routes = cfg.Routes

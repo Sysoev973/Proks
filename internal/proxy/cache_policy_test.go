@@ -417,3 +417,19 @@ func TestChunkedResponseIsBufferedAndCached(t *testing.T) {
 		t.Fatalf("expected cached chunked body, got %s len=%d", second.Header().Get("X-Cache-Status"), second.Body.Len())
 	}
 }
+
+func TestMaxTTLCapsResponseFreshness(t *testing.T) {
+	policy := DefaultCachePolicy()
+	policy.MaxTTL = 20 * time.Second
+	long := http.Header{"Cache-Control": {"max-age=3600"}}
+	if decision, ttl := policy.responseDecision(nil, http.StatusOK, long, 0); !decision.Allowed || ttl != 20*time.Second {
+		t.Fatalf("max-age=3600 with MaxTTL=20s gave %+v ttl=%s, want 20s", decision, ttl)
+	}
+	short := http.Header{"Cache-Control": {"max-age=5"}}
+	if _, ttl := policy.responseDecision(nil, http.StatusOK, short, 0); ttl != 5*time.Second {
+		t.Fatalf("a shorter upstream TTL must be kept, got %s", ttl)
+	}
+	if _, ttl := policy.responseDecision(nil, http.StatusOK, http.Header{}, 0); ttl != 20*time.Second {
+		t.Fatalf("SuccessTTL above MaxTTL must be capped, got %s", ttl)
+	}
+}

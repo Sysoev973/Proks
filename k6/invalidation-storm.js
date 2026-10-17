@@ -20,8 +20,10 @@ export default function () {
     check(res, { 'status is 200': (r) => r.status === 200 });
     return;
   }
-  const version = __VU * 1000000 + __ITER + 1;
-  const payload = JSON.stringify({ tags: ['book:1', 'list:books'], version });
+  // Без version: purge без версии чистит кэш, но не трогает версии тегов.
+  // Синтетическая версия (раньше VU*1e6+ITER) сохранялась бы в state.json
+  // реплик и потом отклоняла настоящие события book:1 из outbox.
+  const payload = JSON.stringify({ tags: ['book:1', 'list:books'] });
   const res = http.post(`${BASE_URL}/admin/purge`, payload, {
     headers: {
       'Content-Type': 'application/json',

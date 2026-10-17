@@ -126,7 +126,7 @@ curl.exe -i -X POST http://localhost:8080/internal/events/book.updated -H "Autho
 
 Для RabbitMQ каждая реплика использует собственную durable-очередь. Обязательная переменная `PROXY_REPLICA_ID` должна быть стабильной и уникальной для реплики; без неё RabbitMQ-брокер не запускается. Для сохранения deduplication-версий между перезапусками задайте `EVENT_VERSION_STATE_PATH` на постоянный том.
 
-Publisher использует persistent messages и RabbitMQ publisher confirms. `EVENT_LOG_PATH` и `EVENT_VERSION_STATE_PATH` обязательны для RabbitMQ-брокера: событие перед публикацией добавляется в durable append-only event log, а обработанные `event_id` и версии сохраняются атомарно. Event log повторно проигрывается при старте consumer-а и покрывает события, опубликованные до создания очереди. Для нескольких независимых узлов event log должен находиться на общем durable-хранилище либо быть заменён PostgreSQL outbox/RabbitMQ Stream.
+Publisher использует persistent messages и RabbitMQ publisher confirms. `EVENT_LOG_PATH` и `EVENT_VERSION_STATE_PATH` обязательны для RabbitMQ-брокера: событие перед публикацией добавляется в durable append-only event log, а обработанные `event_id` и версии сохраняются атомарно. Event log повторно проигрывается при старте consumer-а и покрывает события, опубликованные до создания очереди. Event log относится только к событиям, которые приходят в прокси через `/admin/purge` и `/internal/events/book.updated`; изменения из upstream публикуются через PostgreSQL outbox (см. ниже).
 
 Publisher имеет отдельное AMQP-соединение и автоматически переподключает channel/connection после `NotifyClose` или ошибки подтверждения. Публикация сериализована, поэтому confirmation однозначно относится к текущему `event_id`; после переподключения событие повторяется с тем же идентификатором.
 
@@ -354,7 +354,31 @@ HIT вместе с access-логом здесь — около 7 мкс; на �
 | `read-heavy.js` | 0.52 мс | 1.63 мс | 0% |
 | `mixed.js` | 0.58 мс | 2.29 мс | 0% |
 
-Цифры для docker-стенда с PostgreSQL ещё не сняты: `docker compose up -d --build`, затем `docker compose --profile load run --rm k6 run --summary-trend-stats "med,p(95),p(99)" /scripts/mixed.js`.
+**Docker-стенд с PostgreSQL** (Docker Desktop на том же ноутбуке, `k6/prefetch-chain.js`, 2000 книг, 40 цепочек/с, замер 2 минуты после 30 с прогрева, `CACHE_MAX_TTL=20s`).
+
+Предзагрузка, `bench/prefetch-ab.ps1`, медиана по 3 прогонам на каждый режим:
+
+| | `PREFETCH_ENABLED=false` | `true` |
+|---|---|---|
+| авторы p50 / p95 / p99 | 1.06 / 2.09 / 2.60 мс | 0.68 / 1.63 / 2.17 мс |
+| карточка p95 | 2.40 мс | 2.52 мс |
+| все запросы p95 | 2.27 мс | 2.29 мс |
+| hit ratio (сервер) | 41.1% | 59.3% |
+| запросы к upstream | 40.5 rps | 40.6 rps, из них 12.3 от предзагрузки |
+| бесполезные предзагрузки | — | 0% |
+
+Предзагрузка снижает p95 второго запроса цепочки на 22% (p50 на 36%) и не добавляет нагрузки на upstream: предзагруженные запросы заменяют клиентские промахи, а не добавляются к ним. Карточку и общий p95 она почти не меняет, как и ожидалось. В абсолютных числах выигрыш около 0.4 мс, потому что upstream и PostgreSQL на той же машине. С реальным upstream выигрыш будет примерно равен его задержке.
+
+Одна и две реплики: со случайным выбором реплики и через балансировщик по ключу (перед каждым прогоном реплики пересоздаются):
+
+| | 1 реплика | 2 реплики, случайно | 2 реплики через `balancer` |
+|---|---|---|---|
+| hit ratio (сервер) | 58.9% | 35.3% | 59.6% |
+| запросы к upstream | 40.2 rps | 59.3 rps | 40.2 rps |
+| бесполезные предзагрузки | 0% | 38.1% | 0% |
+| авторы p50 / p95 | 0.89 / 1.67 мс | 1.04 / 1.64 мс | 1.06 / 2.09 мс |
+
+На двух репликах hit ratio падает на 23.6 п.п., а RPS к upstream растёт на 47%. Оба значения выше порогов из раздела «Несколько реплик», поэтому для нескольких реплик нужна балансировка по ключу. Бесполезные предзагрузки появляются по той же причине: карточка и авторы попадают на разные реплики. Через балансировщик по ключу (`docker/nginx/nginx.conf`) две реплики дают те же hit ratio, нагрузку на upstream и долю бесполезных предзагрузок, что и одна. Цена — лишний сетевой hop через nginx: на Docker Desktop это около 0.2–0.4 мс к p95 и p50.
 
 # Конфигурация прокси
 
@@ -362,6 +386,9 @@ HIT вместе с access-логом здесь — около 7 мкс; на �
 |---|---|---|
 | `UPSTREAM_URL`, `LISTEN_ADDR` | `http://localhost:8081`, `:8080` | адреса |
 | `CACHE_CAPACITY`, `CACHE_MAX_BYTES` | `10000`, `268435456` | размер кэша |
+| `CACHE_TTL` | `5m` | свежесть ответа без `max-age`/`Expires` |
+| `CACHE_MAX_TTL` | без ограничения | потолок свежести, в том числе для `max-age` upstream |
+| `CACHE_STALE_WHILE_REVALIDATE`, `CACHE_STALE_IF_ERROR` | `10s`, `5m` | окна отдачи устаревшей записи, если upstream не задал свои |
 | `ROUTES_CONFIG` | — | YAML с тегами по маршрутам, пример в `routes.example.yaml` |
 | `ADMIN_TOKEN`, `ADMIN_LISTEN_ADDR` | — | доступ к `/admin/purge` и `/internal/events/book.updated` |
 | `PREFETCH_ENABLED` | `false` | включает prefetch по цепи Маркова |
@@ -391,21 +418,95 @@ curl -X POST http://localhost:8080/admin/purge -H "Authorization: Bearer dev-adm
 
 ## Prefetch
 
-С `PREFETCH_ENABLED=true` прокси запоминает переходы между страницами (по `Referer` или `X-Prev-Route-Key`) и после запроса A заранее загружает вероятный следующий маршрут B. Prefetch идёт тем же путём, что обычный промах (singleflight, политика кэша, учёт инвалидаций), только для анонимных `GET` (без `Authorization` и `Cookie`), в рамках `PREFETCH_RPS` и приостанавливается на 5 с после ошибки upstream. Первый запрос к B после этого получает `X-Cache-Status: PREFETCH`. Метрики: `proxy_prefetch_executed_total`, `proxy_prefetch_failed_total`.
+С `PREFETCH_ENABLED=true` прокси запоминает переходы между страницами (по `Referer` или `X-Prev-Route-Key`) и после запроса A заранее загружает вероятный следующий маршрут B. Prefetch идёт тем же путём, что обычный промах (singleflight, политика кэша, учёт инвалидаций), только для анонимных `GET` (без `Authorization` и `Cookie`), в рамках `PREFETCH_RPS` и приостанавливается на 5 с после ошибки upstream. Первый запрос к B после этого получает `X-Cache-Status: PREFETCH`. Метрики: `proxy_prefetch_executed_total`, `proxy_prefetch_failed_total`, `proxy_cache_prefetch_hits_total` (первые попадания в предзагруженные записи, в `proxy_cache_hits_total` не входят) и `proxy_upstream_requests_total{kind="client|prefetch|revalidate"}`.
 
 ## Несколько реплик
 
-Каждая реплика держит свой кэш в памяти; после перезапуска он пуст. Согласованность не страдает (purge доходит до всех реплик), но при N репликах upstream получает до N промахов на ключ. Самый дешёвый способ это убрать — балансировка по ключу на ingress, чтобы один и тот же URL всегда шёл в одну реплику. Пример для nginx:
+Каждая реплика держит свой кэш в памяти; после перезапуска он пуст. Согласованность не страдает (purge доходит до всех реплик), но при N репликах upstream получает до N промахов на ключ. Балансировка по ключу и общий кэш (Redis) — условные шаги, и критерий их включения выбран заранее.
 
-```nginx
-upstream proks {
-    hash $request_uri consistent;
-    server proxy-1:8080;
-    server proxy-2:8080;
-}
+**Замер.** Один и тот же `k6/prefetch-chain.js` с одинаковыми `RATE` и `BOOKS` на одной и на двух репликах (`proxy` на `8080`, `proxy-2` на `8082`). Запрос уходит на случайную реплику, то есть балансировщик без привязки к ключу:
+
+```powershell
+k6 run -e PROXY_URLS=http://localhost:8080 k6\prefetch-chain.js
+k6 run -e PROXY_URLS=http://localhost:8080,http://localhost:8082 k6\prefetch-chain.js
 ```
 
-Хранилище спрятано за интерфейсом `cache.Store` (`internal/cache/cache.go`), поэтому общий L2 (Redis) или peer-кэш можно добавить без изменений в handler. Делать это стоит, только если метрики покажут, что промахи между репликами реально нагружают upstream.
+Сравниваются `server hit ratio` и `upstream rps` из итогов k6 (сумма по всем репликам).
+
+**Критерий.**
+
+1. Если на N репликах RPS к upstream вырос на **30% и больше** или hit ratio упал на **10 п.п. и больше** относительно одной реплики, включаем балансировку по ключу на ingress. Тогда каждый ресурс живёт на одной реплике, и кэш снова работает как один.
+
+2. Redis (общий L2) рассматриваем только если после балансировки по ключу остаётся одна из проблем: падение реплики уводит её долю ключей в upstream сильнее допустимого, или общий кэш нужен сервисам вне прокси. Redis добавляет сетевой hop на каждый HIT (сотни микросекунд против единиц микросекунд in-memory), поэтому без такой причины он ухудшает основной показатель прокси. Хранилище спрятано за интерфейсом `cache.Store` (`internal/cache/cache.go`), так что L2 добавляется без изменений в handler.
+3. Если ни один порог не превышен, оставляем как есть.
+
+**Результат замера** (см. «Результаты измерений»): на двух репликах hit ratio −23.6 п.п., RPS к upstream +47%. Оба порога превышены, поэтому балансировка по ключу добавлена в стенд. Через неё две реплики снова работают как одна: hit ratio 59.6% против 58.9% у одной реплики, RPS к upstream 40.2 против 40.2. Redis по пункту 2 не нужен.
+
+### Балансировщик по ключу
+
+Сервис `balancer` (nginx, порт `8090`, конфиг `docker/nginx/nginx.conf`) стоит перед `proxy` и `proxy-2` и выбирает реплику через `hash ... consistent`. Ключ — первые два сегмента пути: `/books/42` и `/books/42/authors` дают один ключ `/books/42`. Хэш по полному `$request_uri` здесь не подходит: карточка и авторы попали бы на разные реплики, и предзагрузка перестала бы работать, потому что переход «карточка → авторы» предиктор видел бы на одной реплике, а карточку обслуживала бы другая. При падении реплики nginx отправляет запрос на следующую по кольцу (`proxy_next_upstream`), и её ключи временно идут в upstream мимо кэша.
+
+Замер через балансировщик. Запросы идут на `8090`, а метрики снимаются с каждой реплики напрямую (`METRICS_URLS`):
+
+```powershell
+docker compose up -d --force-recreate --no-deps --wait proxy proxy-2 balancer
+k6 run -e PROXY_URLS=http://localhost:8090 -e METRICS_URLS=http://localhost:8080,http://localhost:8082 k6\prefetch-chain.js
+```
+
+## Обновление книг и инвалидация (transactional outbox)
+
+`PUT /books/{id}` в upstream принимает частичное обновление (`title`, `isbn`, `publication_year`, `is_rare`, `has_ebook`, `genre_id`) и в одной транзакции:
+
+1. обновляет строку в `books` и увеличивает `version`;
+2. пишет в `invalidation_outbox` строку `(event_id, tags, version)`: тег `book:<id>` с новой версией, а если сменился жанр, ещё `list:books` без версии.
+
+Фоновый relay в upstream читает outbox (`FOR UPDATE SKIP LOCKED`, по порядку `id`), публикует событие `invalidate` в RabbitMQ с publisher confirm и удаляет строку только после подтверждения. Если RabbitMQ недоступен или процесс упал между коммитом и отправкой, строка остаётся в таблице и уйдёт после восстановления: инвалидация задерживается, но не теряется. При ошибке у строки растут `attempts` и записывается `last_error`, relay останавливается на первой неудачной строке (порядок сохраняется) и повторяет попытку с экспоненциальной паузой до 30 с. Сразу после коммита relay будится напрямую; `OUTBOX_POLL_INTERVAL` (по умолчанию `1s`) нужен как запасной опрос, например для строк, записанных другой репликой upstream. Без `RABBITMQ_URL` upstream работает, но строки копятся в outbox.
+
+Доставка at-least-once. Повтор после падения приходит с тем же `event_id`, и прокси его отбрасывает. GET-ответы карточки несут `X-Upstream-Book-Version`, прокси хранит версию вместе с записью кэша, поэтому:
+
+- запоздавшее событие со старой версией не удаляет более новую запись;
+- ответ, прочитанный до коммита и пришедший в прокси уже после события о новой версии, не кладётся в кэш (`X-Cache-Status: BYPASS`, `X-Cache-Reason: INVALIDATED`).
+
+Схема лежит в `migrations/002_book_versions_outbox.sql`, upstream применяет её при старте. Если на volume `pgdata` осталась таблица `invalidation_outbox` из ранней версии (с колонкой `book_id`), пересоздайте базу: `docker compose down -v`.
+
+```powershell
+curl.exe -X PUT http://localhost:8080/books/1 -H "Content-Type: application/json" -d '{\"title\":\"Новое название\"}'
+# outbox должен быть пустым, если RabbitMQ доступен
+docker compose exec postgres psql -U library_user -d library_db -c "SELECT id, tags, version, attempts, last_error FROM invalidation_outbox"
+```
+
+## Согласованность кэша
+
+Прокси даёт eventual consistency, строгой согласованности нет.
+
+- **Обычное окно** — от коммита `PUT` до удаления записи на каждой реплике: публикация из outbox, доставка через RabbitMQ, обработка consumer-ом. На локальном стенде это миллисекунды. Если relay не получил сигнал после коммита, добавляется до `OUTBOX_POLL_INTERVAL`.
+- **Худший случай** — пока RabbitMQ, relay или consumer реплики недоступны, запись живёт до конца своей свежести и окон устаревания: TTL (`Cache-Control: max-age` ответа или `CACHE_TTL`, не больше `CACHE_MAX_TTL`, если он задан) плюс `stale-while-revalidate` (`CACHE_STALE_WHILE_REVALIDATE`, по умолчанию 10 с), а при ошибках upstream — до `stale-if-error` (`CACHE_STALE_IF_ERROR`, по умолчанию 5 минут).
+- **Read-your-writes не гарантируется.** Клиент, получивший `200` на `PUT`, следующим `GET` может прочитать старую версию: событие ещё в пути или запрос попал на другую реплику. Свежая версия есть в теле ответа `PUT`; можно также отправить `GET` с `Cache-Control: no-cache`.
+
+Версии тегов, которые уже видела реплика, хранятся в `EVENT_VERSION_STATE_PATH` и переживают перезапуск. Поэтому сброс базы без сброса этого состояния ломает инвалидацию: версии книг начинаются заново, а прокси считает их старыми. То же случится, если вручную отправить событие с версией больше настоящей (например, `"version": 2` для книги 1 через `/internal/events/book.updated` или `/admin/purge`). Для ручных и нагрузочных purge не указывайте `version`: `k6/invalidation-storm.js` поэтому шлёт purge без версии. После сброса базы удаляйте и состояние событий: `docker compose down -v` или `data/events/` при локальном запуске.
+
+## Замер предзагрузки (A/B)
+
+Сценарий `k6/prefetch-chain.js`: карточка `GET /books/{id}`, пауза `THINK_MS`, затем авторы `GET /books/{id}/authors` с `Referer` на карточку. Переход предсказуем, и при `PREFETCH_ENABLED=true` прокси загружает авторов, пока клиент «думает». При `false` предиктор продолжает учиться, но ничего не загружает, так что режимы различаются только предзагрузкой.
+
+Методика:
+
+- одинаковая нагрузка в обоих режимах (`constant-arrival-rate`, цепочек в секунду);
+- прогрев (`WARMUP`) в метрики не входит;
+- перед каждым прогоном прокси пересоздаётся, порядок режимов чередуется;
+- итог — медиана по нескольким прогонам.
+
+Меряются p50/p95/p99 отдельно для карточки и для авторов, hit ratio, RPS к upstream (клиентский и от предзагрузки, `proxy_upstream_requests_total{kind}`) и доля бесполезных предзагрузок (загружено, но не запрошено; `proxy_cache_prefetch_hits_total` против `proxy_prefetch_executed_total`).
+
+Сценарий берёт книги 1001 и дальше, их добавляет `migrations/bench_seed.sql`. Upstream отдаёт карточки и авторов с `max-age=300`, поэтому скрипт ограничивает свежесть `CACHE_MAX_TTL=20s`, иначе за прогон записи не успевают истечь и предзагрузке нечего ускорять:
+
+```powershell
+docker compose up -d --build --wait postgres rabbitmq upstream proxy
+Get-Content migrations\bench_seed.sql | docker compose exec -T postgres psql -U library_user -d library_db
+.\bench\prefetch-ab.ps1 -Runs 3 -Duration 2m      # Linux/macOS: ./bench/prefetch-ab.sh
+```
+
+Скрипт печатает таблицу медиан, а JSON каждого прогона сохраняет в `bench/results/`. Смотреть нужно в первую очередь на `authors p95`, то есть на второй запрос цепочки. Общий p95 при высоком hit ratio почти не меняется: большинство запросов и так попадает в кэш.
 
 # Покрытие и CI
 

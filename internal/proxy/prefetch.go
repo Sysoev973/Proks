@@ -130,6 +130,7 @@ func (h *Handler) Prefetch(ctx context.Context, key string) error {
 	if _, err := h.cache.Get(ctx, key); err == nil || h.cacheIsPolluted(key) {
 		return errPrefetchSkipped
 	}
+	ctx = withUpstreamKind(ctx, upstreamKindPrefetch)
 	res, _, err := h.fetch(ctx, req.WithContext(ctx), key, true)
 	if err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {

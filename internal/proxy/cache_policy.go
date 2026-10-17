@@ -11,11 +11,14 @@ import (
 
 // CachePolicy controls which requests and responses may be stored.
 type CachePolicy struct {
-	CacheMethods          map[string]bool
-	AllowedStatus         []StatusRange
-	SuccessTTL            time.Duration
-	ErrorTTL              time.Duration
-	RespectResponseTTL    bool
+	CacheMethods       map[string]bool
+	AllowedStatus      []StatusRange
+	SuccessTTL         time.Duration
+	ErrorTTL           time.Duration
+	RespectResponseTTL bool
+	// MaxTTL caps the freshness of every stored response, including one the
+	// upstream allows to keep longer. Zero means no cap.
+	MaxTTL                time.Duration
 	StaleWhileRevalidate  time.Duration
 	StaleIfError          time.Duration
 	CacheErrors           bool
@@ -150,6 +153,9 @@ func (p CachePolicy) responseDecision(r *http.Request, status int, headers http.
 		} else if ok {
 			ttl = responseTTL
 		}
+	}
+	if p.MaxTTL > 0 && ttl > p.MaxTTL {
+		ttl = p.MaxTTL
 	}
 	return cacheDecision{Allowed: true}, ttl
 }
