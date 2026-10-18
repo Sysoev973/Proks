@@ -21,6 +21,7 @@ const (
 	prefetchRequestTTL   = time.Minute
 	prefetchPauseOnError = 5 * time.Second
 	defaultPrefetchRPS   = 20
+	defaultRefreshRPS    = 10
 )
 
 // prefetchRequest is what a client following the current request to the
@@ -105,13 +106,39 @@ func (h *Handler) pausePrefetch() {
 	h.prefetchPausedUntil.Store(time.Now().Add(prefetchPauseOnError).UnixNano())
 }
 
-func (h *Handler) prefetchAllowed() bool {
-	if time.Now().UnixNano() < h.prefetchPausedUntil.Load() {
-		return false
+// SetRefreshBudget limits refresh-ahead requests to upstream to rps per
+// second, separately from prefetch, so refreshes do not take prefetch's
+// budget; rps <= 0 means no limit.
+func (h *Handler) SetRefreshBudget(rps float64) {
+	h.prefetchMu.Lock()
+	defer h.prefetchMu.Unlock()
+	if rps <= 0 {
+		h.refreshLimiter = nil
+		return
 	}
+	h.refreshLimiter = newRateLimiter(rps)
+}
+
+func (h *Handler) prefetchAllowed() bool {
 	h.prefetchMu.Lock()
 	limiter := h.prefetchLimiter
 	h.prefetchMu.Unlock()
+	return h.backgroundAllowed(limiter)
+}
+
+func (h *Handler) refreshAllowed() bool {
+	h.prefetchMu.Lock()
+	limiter := h.refreshLimiter
+	h.prefetchMu.Unlock()
+	return h.backgroundAllowed(limiter)
+}
+
+// backgroundAllowed reports whether a background request fits limiter and
+// the upstream is not paused after an error.
+func (h *Handler) backgroundAllowed(limiter *rateLimiter) bool {
+	if time.Now().UnixNano() < h.prefetchPausedUntil.Load() {
+		return false
+	}
 	return limiter == nil || limiter.allow(time.Now())
 }
 

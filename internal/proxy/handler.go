@@ -69,10 +69,17 @@ type Handler struct {
 	inflight          singleflight.Group
 	invalidations     *invalidationTracker
 	routes            routeTable
+	// routePredictor learns transitions between route templates
+	// (/books/{id} -> /books/{id}/authors), so a resource nobody has opened
+	// yet still gets its next route prefetched. Nil without routes.
+	routePredictor *predictor.Markov
+	// refreshing holds the keys with a refresh-ahead in flight.
+	refreshing sync.Map
 
 	prefetchMu          sync.Mutex
 	prefetchRequests    map[string]prefetchRequest
 	prefetchLimiter     *rateLimiter
+	refreshLimiter      *rateLimiter
 	prefetchPausedUntil atomic.Int64
 }
 
@@ -109,6 +116,7 @@ func NewHandlerWithPolicy(cache cache.Cache, pred predictor.Predictor, pf prefet
 		invalidations:     newInvalidationTracker(),
 		routes:            routes,
 		prefetchLimiter:   newRateLimiter(defaultPrefetchRPS),
+		refreshLimiter:    newRateLimiter(defaultRefreshRPS),
 		httpClient: &http.Client{
 			Timeout: 2 * time.Second,
 			Transport: &http.Transport{
@@ -118,6 +126,9 @@ func NewHandlerWithPolicy(cache cache.Cache, pred predictor.Predictor, pf prefet
 				IdleConnTimeout:     30 * time.Second,
 			},
 		},
+	}
+	if len(routes) > 0 {
+		h.routePredictor = predictor.NewMarkov()
 	}
 	return h, nil
 }
@@ -177,6 +188,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					reason = string(cache.ReasonLRU)
 				}
 				writeCachedItem(w, item, status, reason)
+				h.maybeRefreshAhead(r, key, item)
 				h.maybePrefetchForRequest(ctx, r, current)
 				return
 			}
@@ -341,11 +353,46 @@ func (h *Handler) fetch(ctx context.Context, r *http.Request, key string, cachea
 	}
 }
 
-func (h *Handler) revalidate(r *http.Request, key string) {
+func (h *Handler) revalidate(r *http.Request, key string) <-chan singleflight.Result {
 	req := r.Clone(withUpstreamKind(context.WithoutCancel(r.Context()), upstreamKindRevalidate))
-	h.inflight.DoChan(key, func() (interface{}, error) {
+	return h.inflight.DoChan(key, func() (interface{}, error) {
 		return h.fetchAndStore(req.Context(), req, key, true)
 	})
+}
+
+// maybeRefreshAhead revalidates a fresh item in the background when it is in
+// the last RefreshAhead share of its lifetime and its key is hot, so popular
+// entries are renewed before they expire. Refreshes have their own budget
+// and share the pause after an upstream error with prefetch, so mass expiry
+// does not flood the upstream.
+func (h *Handler) maybeRefreshAhead(r *http.Request, key string, item cache.Item) {
+	share := h.policy.RefreshAhead
+	if share <= 0 || item.StoredAt.IsZero() || item.ExpiresAt.IsZero() {
+		return
+	}
+	lifetime := item.ExpiresAt.Sub(item.StoredAt)
+	if time.Until(item.ExpiresAt) >= time.Duration(float64(lifetime)*share) {
+		return
+	}
+	adm := h.tinyLFU()
+	if adm == nil || adm.Filter == nil || uint64(adm.Filter.Estimate(key)) < h.policy.RefreshMinHits {
+		return
+	}
+	if _, busy := h.refreshing.LoadOrStore(key, struct{}{}); busy {
+		return
+	}
+	if !h.refreshAllowed() {
+		h.refreshing.Delete(key)
+		return
+	}
+	if h.metrics != nil {
+		h.metrics.RecordRefreshAhead()
+	}
+	done := h.revalidate(r, key)
+	go func() {
+		<-done
+		h.refreshing.Delete(key)
+	}()
 }
 
 // makes its response differ from the cached one.
@@ -401,7 +448,8 @@ func (h *Handler) fetchAndStore(ctx context.Context, r *http.Request, key string
 	if !cacheable || !res.decision.Allowed {
 		return res, nil
 	}
-	expiresAt := time.Now().Add(ttl)
+	storedAt := time.Now()
+	expiresAt := storedAt.Add(ttl)
 	swr, sie := h.policy.staleWindows(upstream.headers)
 	item := cache.Item{
 		Key:        key,
@@ -410,6 +458,7 @@ func (h *Handler) fetchAndStore(ctx context.Context, r *http.Request, key string
 		StatusCode: upstream.status,
 		ExpiresAt:  expiresAt,
 		StaleUntil: expiresAt.Add(max(swr, sie)),
+		StoredAt:   storedAt,
 		Version:    versionFromResponse(upstream.headers),
 		Tags:       h.routes.tagsForResponse(r, upstream.headers),
 	}
@@ -638,6 +687,70 @@ func (h *Handler) recordTransition(r *http.Request, current string) {
 	if h.trend != nil {
 		h.trend.ObserveTransition(prev, current, true)
 	}
+	h.recordTemplateTransition(prev, current)
+}
+
+// recordTemplateTransition generalizes prev -> current to their route
+// templates when current can be rebuilt from prev's placeholder values:
+// /books/42 -> /books/42/authors is learned as /books/{id} ->
+// /books/{id}/authors, while /books/42 -> /genres/3 stays concrete only.
+func (h *Handler) recordTemplateTransition(prev, current string) {
+	if h.routePredictor == nil {
+		return
+	}
+	prevMatch, prevParams, ok := h.routes.template(prev)
+	if !ok {
+		return
+	}
+	curMatch, curParams, ok := h.routes.template(current)
+	if !ok || curMatch == prevMatch || !sameParams(prevParams, curParams) {
+		return
+	}
+	h.routePredictor.Update(prevMatch, curMatch)
+}
+
+// predictNext returns the route to prefetch after current. The concrete
+// predictor wins when it is confident; otherwise the template predictor's
+// guess is filled with current's placeholder values.
+func (h *Handler) predictNext(current string) (string, bool) {
+	if route, ok := h.confident(h.predictor.Predict(current), nil); ok {
+		return route, true
+	}
+	if h.routePredictor == nil {
+		return "", false
+	}
+	match, params, ok := h.routes.template(current)
+	if !ok {
+		return "", false
+	}
+	return h.confident(h.routePredictor.Predict(match), func(next string) (string, bool) {
+		route, ok := h.routes.byMatch(next)
+		if !ok {
+			return "", false
+		}
+		return route.expand(params)
+	})
+}
+
+// confident returns the top candidate, mapped to a concrete route by expand
+// when given, if its probability adjusted by the trend reaches the threshold.
+func (h *Handler) confident(candidates []predictor.Candidate, expand func(string) (string, bool)) (string, bool) {
+	if len(candidates) == 0 {
+		return "", false
+	}
+	top := candidates[0]
+	route := top.Key
+	if expand != nil {
+		var ok bool
+		if route, ok = expand(top.Key); !ok {
+			return "", false
+		}
+	}
+	probability := top.Probability
+	if h.trend != nil {
+		probability = h.trend.AdjustProbability(route, probability)
+	}
+	return route, probability >= h.prefetchThreshold
 }
 
 func resolvePreviousRoute(r *http.Request) string {
@@ -684,22 +797,14 @@ func (h *Handler) maybePrefetchForRequest(ctx context.Context, r *http.Request, 
 		return
 	}
 	cacheCtx := context.Background()
-	candidates := h.predictor.Predict(current)
-	if len(candidates) == 0 {
-		return
-	}
-	top := candidates[0]
-	adjustedProbability := top.Probability
-	if h.trend != nil {
-		adjustedProbability = h.trend.AdjustProbability(top.Key, top.Probability)
-	}
-	if adjustedProbability < h.prefetchThreshold {
+	route, ok := h.predictNext(current)
+	if !ok {
 		return
 	}
 	if pf, ok := h.prefetcher.(interface{ Enabled() bool }); ok && !pf.Enabled() {
 		return
 	}
-	prefetchReq, prefetchKey, ok := h.prefetchTemplate(r, top.Key)
+	prefetchReq, prefetchKey, ok := h.prefetchTemplate(r, route)
 	if !ok {
 		return
 	}

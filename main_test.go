@@ -117,6 +117,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.CacheTTL != 5*time.Minute || cfg.CacheMaxTTL != 0 {
 		t.Fatalf("unexpected TTL defaults: %+v", cfg)
 	}
+	if cfg.CacheRefreshAhead != 0 || cfg.CacheRefreshMinHits != 3 || cfg.CacheRefreshRPS != 10 {
+		t.Fatalf("refresh-ahead must be off by default: %+v", cfg)
+	}
 	if cfg.PrefetchEnabled || cfg.PrefetchRPS != 20 || cfg.PrefetchTimeout != time.Second {
 		t.Fatalf("prefetch must be off by default with a budget: %+v", cfg)
 	}
@@ -131,16 +134,19 @@ func TestLoadConfigParsesValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg, err := loadConfig(envMap(map[string]string{
-		"UPSTREAM_URL":     "http://up:9000",
-		"CACHE_CAPACITY":   "42",
-		"CACHE_TTL":        "1m",
-		"CACHE_MAX_TTL":    "20s",
-		"EWMA_ALPHA":       "0.5",
-		"PREFETCH_ENABLED": "true",
-		"PREFETCH_TIMEOUT": "250ms",
-		"LOG_LEVEL":        "debug",
-		"LOG_HIT_SAMPLE":   "10",
-		"ROUTES_CONFIG":    routes,
+		"UPSTREAM_URL":           "http://up:9000",
+		"CACHE_CAPACITY":         "42",
+		"CACHE_TTL":              "1m",
+		"CACHE_MAX_TTL":          "20s",
+		"CACHE_REFRESH_AHEAD":    "0.1",
+		"CACHE_REFRESH_MIN_HITS": "5",
+		"CACHE_REFRESH_RPS":      "50",
+		"EWMA_ALPHA":             "0.5",
+		"PREFETCH_ENABLED":       "true",
+		"PREFETCH_TIMEOUT":       "250ms",
+		"LOG_LEVEL":              "debug",
+		"LOG_HIT_SAMPLE":         "10",
+		"ROUTES_CONFIG":          routes,
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -148,7 +154,8 @@ func TestLoadConfigParsesValues(t *testing.T) {
 	if cfg.UpstreamURL != "http://up:9000" || cfg.CacheCapacity != 42 || cfg.EWMAAlpha != 0.5 ||
 		!cfg.PrefetchEnabled || cfg.PrefetchTimeout != 250*time.Millisecond ||
 		cfg.LogLevel != slog.LevelDebug || cfg.LogHitSample != 10 ||
-		cfg.CacheTTL != time.Minute || cfg.CacheMaxTTL != 20*time.Second {
+		cfg.CacheTTL != time.Minute || cfg.CacheMaxTTL != 20*time.Second ||
+		cfg.CacheRefreshAhead != 0.1 || cfg.CacheRefreshMinHits != 5 || cfg.CacheRefreshRPS != 50 {
 		t.Fatalf("values not parsed: %+v", cfg)
 	}
 	if len(cfg.Routes) != 1 || cfg.Routes[0].Match != "/orders/{id}" {
@@ -164,6 +171,8 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 		"CACHE_STALE_WHILE_REVALIDATE": "-5s",
 		"CACHE_TTL":                    "0s",
 		"CACHE_MAX_TTL":                "soon",
+		"CACHE_REFRESH_AHEAD":          "0.6",
+		"CACHE_REFRESH_MIN_HITS":       "-1",
 		"RABBITMQ_REQUIRED":            "maybe",
 		"LOG_LEVEL":                    "loud",
 		"ROUTES_CONFIG":                filepath.Join(t.TempDir(), "missing.yaml"),

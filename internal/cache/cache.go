@@ -37,8 +37,11 @@ type Item struct {
 	StatusCode int
 	ExpiresAt  time.Time
 	StaleUntil time.Time
-	Version    int64
-	Tags       []string
+	// StoredAt is when the item was stored; with ExpiresAt it gives the
+	// item's freshness lifetime. Set fills it when it is zero.
+	StoredAt time.Time
+	Version  int64
+	Tags     []string
 }
 
 // fresh reports whether the item may be served without revalidation.
@@ -287,6 +290,9 @@ func (c *InMemoryCache) Set(_ context.Context, item Item, metrics Metrics) bool 
 	}
 
 	stored := copyItem(item)
+	if stored.StoredAt.IsZero() {
+		stored.StoredAt = time.Now()
+	}
 	if existing != nil {
 		if existing.timer != nil {
 			existing.timer.Stop()

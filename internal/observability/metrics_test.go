@@ -75,22 +75,24 @@ func TestMetricsValues(t *testing.T) {
 	m.RecordUpstreamError("timeout")
 	m.RecordQueueDepth(7)
 	m.RecordPollution(0.5)
+	m.RecordRefreshAhead()
 
 	for name, want := range map[string]float64{
-		"proxy_cache_hits_total":         2,
-		"proxy_cache_misses_total":       1,
-		"proxy_cache_bypasses_total":     1,
-		"proxy_cache_stale_total":        1,
-		"proxy_prefetch_executed_total":  3,
-		"proxy_prefetch_dropped_total":   3,
-		"proxy_prefetch_canceled_total":  2,
-		"proxy_prefetch_failed_total":    4,
-		"proxy_prefetch_total":           2,
-		"proxy_upstream_collapsed_total": 1,
-		"proxy_cache_too_large_total":    1,
-		"proxy_upstream_errors_total":    1,
-		"proxy_prefetch_queue_depth":     7,
-		"proxy_cache_pollution_ratio":    0.5,
+		"proxy_cache_hits_total":          2,
+		"proxy_cache_misses_total":        1,
+		"proxy_cache_bypasses_total":      1,
+		"proxy_cache_stale_total":         1,
+		"proxy_prefetch_executed_total":   3,
+		"proxy_prefetch_dropped_total":    3,
+		"proxy_prefetch_canceled_total":   2,
+		"proxy_prefetch_failed_total":     4,
+		"proxy_prefetch_total":            2,
+		"proxy_upstream_collapsed_total":  1,
+		"proxy_cache_too_large_total":     1,
+		"proxy_upstream_errors_total":     1,
+		"proxy_prefetch_queue_depth":      7,
+		"proxy_cache_pollution_ratio":     0.5,
+		"proxy_cache_refresh_ahead_total": 1,
 	} {
 		if got := counter(t, m, name); got != want {
 			t.Errorf("%s = %v, want %v", name, got, want)

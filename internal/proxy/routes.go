@@ -37,6 +37,7 @@ func LoadRoutes(file string) ([]Route, error) {
 }
 
 type compiledRoute struct {
+	match    string
 	segments []string
 	tags     []string
 }
@@ -70,7 +71,7 @@ func compileRoutes(routes []Route) (routeTable, error) {
 				return nil, fmt.Errorf("route %q: invalid tag template %q", route.Match, tag)
 			}
 		}
-		table = append(table, compiledRoute{segments: segments, tags: route.Tags})
+		table = append(table, compiledRoute{match: route.Match, segments: segments, tags: route.Tags})
 	}
 	return table, nil
 }
@@ -81,7 +82,7 @@ func (t routeTable) tagsFor(r *http.Request) []string {
 	}
 	segments := splitPath(r.URL.Path)
 	for _, route := range t {
-		params, ok := route.match(segments)
+		params, ok := route.matchSegments(segments)
 		if !ok {
 			continue
 		}
@@ -104,7 +105,56 @@ func (t routeTable) tagsFor(r *http.Request) []string {
 	return nil
 }
 
-func (r compiledRoute) match(segments []string) (map[string]string, bool) {
+// template returns the first route matching path, its template and the
+// values of its placeholders.
+func (t routeTable) template(path string) (match string, params map[string]string, ok bool) {
+	segments := splitPath(path)
+	for _, route := range t {
+		if params, ok := route.matchSegments(segments); ok {
+			return route.match, params, true
+		}
+	}
+	return "", nil, false
+}
+
+func (t routeTable) byMatch(match string) (compiledRoute, bool) {
+	for _, route := range t {
+		if route.match == match {
+			return route, true
+		}
+	}
+	return compiledRoute{}, false
+}
+
+// expand fills the route's placeholders from params; it fails when one of
+// them has no value.
+func (r compiledRoute) expand(params map[string]string) (string, bool) {
+	out := make([]string, len(r.segments))
+	for i, segment := range r.segments {
+		if name, ok := placeholder(segment); ok {
+			v := params[name]
+			if v == "" {
+				return "", false
+			}
+			segment = v
+		}
+		out[i] = segment
+	}
+	return "/" + strings.Join(out, "/"), true
+}
+
+// sameParams reports whether every placeholder value of next is also in prev
+// under the same name, so the next path can be rebuilt from prev's values.
+func sameParams(prev, next map[string]string) bool {
+	for name, v := range next {
+		if prev[name] != v {
+			return false
+		}
+	}
+	return true
+}
+
+func (r compiledRoute) matchSegments(segments []string) (map[string]string, bool) {
 	if len(segments) != len(r.segments) {
 		return nil, false
 	}

@@ -77,6 +77,10 @@ services:
       # Empty means the default: CACHE_TTL=5m, CACHE_MAX_TTL without a cap.
       CACHE_TTL: "${CACHE_TTL:-}"
       CACHE_MAX_TTL: "${CACHE_MAX_TTL:-}"
+      # Empty means off; 0.1 refreshes hot entries in the last 10% of their TTL.
+      CACHE_REFRESH_AHEAD: "${CACHE_REFRESH_AHEAD:-}"
+      CACHE_REFRESH_MIN_HITS: "${CACHE_REFRESH_MIN_HITS:-}"
+      CACHE_REFRESH_RPS: "${CACHE_REFRESH_RPS:-}"
       LOG_LEVEL: "info"
     volumes:
       - proxy-events:/var/lib/proks/events
