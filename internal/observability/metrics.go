@@ -28,6 +28,7 @@ type Metrics struct {
 	prefetchFailed   prometheus.Counter
 	invalidations    *prometheus.CounterVec
 	upstreamRequests *prometheus.CounterVec
+	refreshAhead     prometheus.Counter
 }
 
 func NewMetrics() *Metrics {
@@ -108,7 +109,11 @@ func NewMetrics() *Metrics {
 			Help: "Total requests sent upstream, labeled by kind (client, prefetch or revalidate).",
 		}, []string{"kind"}),
 	}
-	reg.MustRegister(m.upstreamRequests, m.prefetchHits, m.hits, m.misses, m.bypasses, m.stale, m.collapsed, m.tooLarge, m.prefetches, m.latency, m.pollution, m.queueDepth, m.prefetchDropped, m.prefetchCanceled, m.upstreamErrors, m.prefetchExecuted, m.prefetchFailed, m.invalidations)
+	m.refreshAhead = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "proxy_cache_refresh_ahead_total",
+		Help: "Total background refreshes of hot entries started before they expired.",
+	})
+	reg.MustRegister(m.refreshAhead, m.upstreamRequests, m.prefetchHits, m.hits, m.misses, m.bypasses, m.stale, m.collapsed, m.tooLarge, m.prefetches, m.latency, m.pollution, m.queueDepth, m.prefetchDropped, m.prefetchCanceled, m.upstreamErrors, m.prefetchExecuted, m.prefetchFailed, m.invalidations)
 	return m
 }
 
@@ -187,6 +192,10 @@ func (m *Metrics) RecordTooLarge() {
 func (m *Metrics) RecordInvalidation(tags, keys int) {
 	m.invalidations.WithLabelValues("tag").Add(float64(tags))
 	m.invalidations.WithLabelValues("key").Add(float64(keys))
+}
+
+func (m *Metrics) RecordRefreshAhead() {
+	m.refreshAhead.Inc()
 }
 
 func (m *Metrics) RecordUpstreamRequest(kind string) {

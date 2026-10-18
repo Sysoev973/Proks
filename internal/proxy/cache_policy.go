@@ -18,7 +18,14 @@ type CachePolicy struct {
 	RespectResponseTTL bool
 	// MaxTTL caps the freshness of every stored response, including one the
 	// upstream allows to keep longer. Zero means no cap.
-	MaxTTL                time.Duration
+	MaxTTL time.Duration
+	// RefreshAhead, when positive, refreshes a hot entry in the background on
+	// a HIT in the last RefreshAhead share of its freshness lifetime, so it
+	// does not expire under load. Zero turns it off; values are capped at 0.5.
+	RefreshAhead float64
+	// RefreshMinHits is the TinyLFU frequency a key needs to be refreshed
+	// ahead, so one-off keys are left to expire.
+	RefreshMinHits        uint64
 	StaleWhileRevalidate  time.Duration
 	StaleIfError          time.Duration
 	CacheErrors           bool
@@ -55,8 +62,14 @@ func DefaultCachePolicy() CachePolicy {
 		VaryHeaders:        []string{"Accept-Encoding"},
 		AllowStreaming:     false,
 		MaxBodySize:        maxRequestBodySize,
+		RefreshMinHits:     defaultRefreshMinHits,
 	}
 }
+
+const (
+	maxRefreshAhead       = 0.5
+	defaultRefreshMinHits = 3
+)
 
 func (p CachePolicy) normalized() CachePolicy {
 	if len(p.CacheMethods) == 0 {
@@ -86,6 +99,7 @@ func (p CachePolicy) normalized() CachePolicy {
 	if p.StaleIfError < 0 {
 		p.StaleIfError = 0
 	}
+	p.RefreshAhead = min(max(p.RefreshAhead, 0), maxRefreshAhead)
 	return p
 }
 

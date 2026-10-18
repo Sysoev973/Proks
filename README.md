@@ -356,7 +356,9 @@ HIT вместе с access-логом здесь — около 7 мкс; на �
 
 **Docker-стенд с PostgreSQL** (Docker Desktop на том же ноутбуке, `k6/prefetch-chain.js`, 2000 книг, 40 цепочек/с, замер 2 минуты после 30 с прогрева, `CACHE_MAX_TTL=20s`).
 
-Предзагрузка, `bench/prefetch-ab.ps1`, медиана по 3 прогонам на каждый режим:
+Предзагрузка, `bench/prefetch-ab.ps1`, медиана по 3 прогонам на каждый режим.
+
+> Таблицы ниже сняты прежней версией `k6/prefetch-chain.js`: hit ratio без STALE, запросы к upstream только клиентские и от предзагрузки, без фоновых обновлений (`kind="revalidate"`, на стенде около 11 rps). Новая версия скрипта печатает обе величины иначе, поэтому её числа с этими таблицами напрямую не сравнимы: для сравнения смотрите `hit_ratio_without_stale` и `upstream_client + upstream_prefetch` из JSON прогона.
 
 | | `PREFETCH_ENABLED=false` | `true` |
 |---|---|---|
@@ -388,6 +390,9 @@ HIT вместе с access-логом здесь — около 7 мкс; на �
 | `CACHE_CAPACITY`, `CACHE_MAX_BYTES` | `10000`, `268435456` | размер кэша |
 | `CACHE_TTL` | `5m` | свежесть ответа без `max-age`/`Expires` |
 | `CACHE_MAX_TTL` | без ограничения | потолок свежести, в том числе для `max-age` upstream |
+| `CACHE_REFRESH_AHEAD` | `0` (выключено) | доля TTL от 0 до 0.5: при HIT в последней доле свежести горячая запись обновляется в фоне |
+| `CACHE_REFRESH_MIN_HITS` | `3` | минимальная частота ключа по TinyLFU для refresh-ahead |
+| `CACHE_REFRESH_RPS` | `10` | бюджет фоновых обновлений refresh-ahead к upstream, отдельный от `PREFETCH_RPS`; `0` — без ограничения |
 | `CACHE_STALE_WHILE_REVALIDATE`, `CACHE_STALE_IF_ERROR` | `10s`, `5m` | окна отдачи устаревшей записи, если upstream не задал свои |
 | `ROUTES_CONFIG` | — | YAML с тегами по маршрутам, пример в `routes.example.yaml` |
 | `ADMIN_TOKEN`, `ADMIN_LISTEN_ADDR` | — | доступ к `/admin/purge` и `/internal/events/book.updated` |
@@ -418,7 +423,15 @@ curl -X POST http://localhost:8080/admin/purge -H "Authorization: Bearer dev-adm
 
 ## Prefetch
 
-С `PREFETCH_ENABLED=true` прокси запоминает переходы между страницами (по `Referer` или `X-Prev-Route-Key`) и после запроса A заранее загружает вероятный следующий маршрут B. Prefetch идёт тем же путём, что обычный промах (singleflight, политика кэша, учёт инвалидаций), только для анонимных `GET` (без `Authorization` и `Cookie`), в рамках `PREFETCH_RPS` и приостанавливается на 5 с после ошибки upstream. Первый запрос к B после этого получает `X-Cache-Status: PREFETCH`. Метрики: `proxy_prefetch_executed_total`, `proxy_prefetch_failed_total`, `proxy_cache_prefetch_hits_total` (первые попадания в предзагруженные записи, в `proxy_cache_hits_total` не входят) и `proxy_upstream_requests_total{kind="client|prefetch|revalidate"}`.
+С `PREFETCH_ENABLED=true` прокси запоминает переходы между страницами (по `Referer` или `X-Prev-Route-Key`) и после запроса A заранее загружает вероятный следующий маршрут B. Prefetch идёт тем же путём, что обычный промах (singleflight, политика кэша, учёт инвалидаций), только для анонимных `GET` (без `Authorization` и `Cookie`), в рамках `PREFETCH_RPS` и приостанавливается на 5 с после ошибки upstream. Первый запрос к B после этого получает `X-Cache-Status: PREFETCH`.
+
+Если задан `ROUTES_CONFIG`, переходы дополнительно обобщаются до шаблонов маршрутов: `/books/42 → /books/42/authors` запоминается и как `/books/{id} → /books/{id}/authors`. Тогда на запрос `/books/43` прокси предзагрузит `/books/43/authors`, даже если книгу 43 ещё никто не открывал. Обобщается только переход, у которого все плейсхолдеры следующего маршрута есть у предыдущего с теми же значениями: `/books/42 → /genres/3` остаётся конкретным. Конкретный предиктор важнее: шаблонный спрашивается, только если у конкретного нет кандидата с вероятностью от 0.7. Порог, тренд и `PREFETCH_RPS` действуют на шаблонные предзагрузки так же, как на конкретные.
+
+Метрики: `proxy_prefetch_executed_total`, `proxy_prefetch_failed_total`, `proxy_cache_prefetch_hits_total` (первые попадания в предзагруженные записи, в `proxy_cache_hits_total` не входят) и `proxy_upstream_requests_total{kind="client|prefetch|revalidate"}`.
+
+## Обновление горячих записей до истечения (refresh-ahead)
+
+С `CACHE_REFRESH_AHEAD=0.1` прокси при HIT проверяет, сколько записи осталось жить. Если меньше 10% её TTL и частота ключа по TinyLFU не ниже `CACHE_REFRESH_MIN_HITS`, запись обновляется в фоне тем же путём, что и в окне stale-while-revalidate (singleflight, учёт инвалидаций). Клиент сразу получает HIT, а популярная запись не истекает. У фоновых обновлений свой бюджет `CACHE_REFRESH_RPS`, чтобы они не отнимали запросы у предзагрузки: на стенде она и так упирается в `PREFETCH_RPS`. После ошибки upstream обновления приостанавливаются вместе с предзагрузкой, поэтому массовое истечение не превращается в шторм запросов. При коротком TTL (как `CACHE_MAX_TTL=20s` на стенде) refresh-ahead почти ничего не даёт: популярные ключи и так покрывает окно stale-while-revalidate. Он нужен при длинном TTL, когда запись успевает выпасть из этого окна. Запросы к upstream идут как `proxy_upstream_requests_total{kind="revalidate"}`, число запущенных обновлений — `proxy_cache_refresh_ahead_total`. По умолчанию выключено.
 
 ## Несколько реплик
 
@@ -496,7 +509,9 @@ docker compose exec postgres psql -U library_user -d library_db -c "SELECT id, t
 - перед каждым прогоном прокси пересоздаётся, порядок режимов чередуется;
 - итог — медиана по нескольким прогонам.
 
-Меряются p50/p95/p99 отдельно для карточки и для авторов, hit ratio, RPS к upstream (клиентский и от предзагрузки, `proxy_upstream_requests_total{kind}`) и доля бесполезных предзагрузок (загружено, но не запрошено; `proxy_cache_prefetch_hits_total` против `proxy_prefetch_executed_total`).
+Меряются p50/p95/p99 отдельно для карточки и для авторов, hit ratio, RPS к upstream (все запросы по `proxy_upstream_requests_total{kind}`: клиентские, от предзагрузки и фоновые обновления) и доля бесполезных предзагрузок (загружено, но не запрошено; `proxy_cache_prefetch_hits_total` против `proxy_prefetch_executed_total`).
+
+Hit ratio — доля ответов из памяти: `(HIT + PREFETCH + STALE) / (HIT + PREFETCH + STALE + MISS + BYPASS)`. STALE входит в попадания: в окне stale-while-revalidate клиент получает запись сразу, а обновление идёт в фоне. Клиентский hit ratio в k6 считается так же, по `X-Cache-Status`. Скрипт печатает долю STALE и hit ratio по старой формуле без STALE, чтобы было видно, сколько дал учёт, а сколько настоящие изменения.
 
 Сценарий берёт книги 1001 и дальше, их добавляет `migrations/bench_seed.sql`. Upstream отдаёт карточки и авторов с `max-age=300`, поэтому скрипт ограничивает свежесть `CACHE_MAX_TTL=20s`, иначе за прогон записи не успевают истечь и предзагрузке нечего ускорять:
 

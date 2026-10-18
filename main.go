@@ -54,6 +54,9 @@ type Config struct {
 	CacheMaxBytes        uint64
 	CacheTTL             time.Duration
 	CacheMaxTTL          time.Duration
+	CacheRefreshAhead    float64
+	CacheRefreshMinHits  uint64
+	CacheRefreshRPS      float64
 	StaleWhileRevalidate time.Duration
 	StaleIfError         time.Duration
 	Routes               []proxy.Route
@@ -172,6 +175,9 @@ func loadConfig(getenv func(string) string) (Config, error) {
 		CacheMaxBytes:        e.uint("CACHE_MAX_BYTES", 256<<20),
 		CacheTTL:             e.duration("CACHE_TTL", 5*time.Minute),
 		CacheMaxTTL:          e.duration("CACHE_MAX_TTL", 0),
+		CacheRefreshAhead:    e.float("CACHE_REFRESH_AHEAD", 0),
+		CacheRefreshMinHits:  e.uint("CACHE_REFRESH_MIN_HITS", 3),
+		CacheRefreshRPS:      e.float("CACHE_REFRESH_RPS", 10),
 		StaleWhileRevalidate: e.duration("CACHE_STALE_WHILE_REVALIDATE", 10*time.Second),
 		StaleIfError:         e.duration("CACHE_STALE_IF_ERROR", 5*time.Minute),
 		EWMAAlpha:            e.float("EWMA_ALPHA", 0.35),
@@ -200,6 +206,9 @@ func loadConfig(getenv func(string) string) (Config, error) {
 	}
 	if cfg.CacheTTL == 0 {
 		e.errs = append(e.errs, errors.New("CACHE_TTL must be positive"))
+	}
+	if cfg.CacheRefreshAhead < 0 || cfg.CacheRefreshAhead > 0.5 {
+		e.errs = append(e.errs, fmt.Errorf("CACHE_REFRESH_AHEAD: %v is outside 0..0.5", cfg.CacheRefreshAhead))
 	}
 	return cfg, errors.Join(e.errs...)
 }
@@ -233,6 +242,8 @@ func run(ctx context.Context, cfg Config) error {
 	policy := proxy.DefaultCachePolicy()
 	policy.SuccessTTL = cfg.CacheTTL
 	policy.MaxTTL = cfg.CacheMaxTTL
+	policy.RefreshAhead = cfg.CacheRefreshAhead
+	policy.RefreshMinHits = cfg.CacheRefreshMinHits
 	policy.StaleWhileRevalidate = cfg.StaleWhileRevalidate
 	policy.StaleIfError = cfg.StaleIfError
 	policy.Routes = cfg.Routes
@@ -245,6 +256,7 @@ func run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("build handler: %w", err)
 	}
 	h.SetPrefetchBudget(cfg.PrefetchRPS)
+	h.SetRefreshBudget(cfg.CacheRefreshRPS)
 	pf.SetOutcomeHook(func(key string, success bool) {
 		if success {
 			h.MarkPrefetched(key)
