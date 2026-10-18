@@ -72,6 +72,7 @@ $rows = foreach ($mode in @("false", "true")) {
         "authors p95"     = "{0:N2}" -f (Median ($set | ForEach-Object { $_.latency_ms.authors.p95 }))
         "authors p99"     = "{0:N2}" -f (Median ($set | ForEach-Object { $_.latency_ms.authors.p99 }))
         "hit ratio"       = "{0:P1}" -f (Median ($set | ForEach-Object { $_.server.hit_ratio }))
+        "stale"           = "{0:P1}" -f (Median ($set | ForEach-Object { $_.server.stale_share }))
         "upstream rps"    = "{0:N1}" -f (Median ($set | ForEach-Object { $_.server.upstream_rps }))
         "useless prefetch"= ($set | ForEach-Object { if ($null -ne $_.server.useless_prefetch_share) { "{0:P0}" -f $_.server.useless_prefetch_share } else { "n/a" } }) -join " / "
     }

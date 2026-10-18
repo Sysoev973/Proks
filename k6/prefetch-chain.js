@@ -37,10 +37,12 @@ const LABEL = __ENV.LABEL || '';
 const COUNTERS = {
   hits: 'proxy_cache_hits_total',
   prefetch_hits: 'proxy_cache_prefetch_hits_total',
+  stale: 'proxy_cache_stale_total',
   misses: 'proxy_cache_misses_total',
   bypasses: 'proxy_cache_bypasses_total',
   upstream_client: 'proxy_upstream_requests_total{kind="client"}',
   upstream_prefetch: 'proxy_upstream_requests_total{kind="prefetch"}',
+  upstream_revalidate: 'proxy_upstream_requests_total{kind="revalidate"}',
   prefetch_executed: 'proxy_prefetch_executed_total',
 };
 
@@ -95,9 +97,11 @@ function pickProxy() {
   return PROXIES[Math.floor(Math.random() * PROXIES.length)];
 }
 
+// STALE is a hit for the client: the response comes from memory at once and
+// is refreshed in the background (stale-while-revalidate).
 function isHit(res) {
   const status = res.headers['X-Cache-Status'];
-  return status === 'HIT' || status === 'PREFETCH';
+  return status === 'HIT' || status === 'PREFETCH' || status === 'STALE';
 }
 
 export function chain() {
@@ -161,6 +165,10 @@ function fmtMs(value) {
   return value === undefined ? 'n/a' : `${value.toFixed(2)}ms`;
 }
 
+function fmtRps(value) {
+  return value === null || value === undefined ? 'n/a' : value.toFixed(1);
+}
+
 function fmtPct(value) {
   return value === undefined || Number.isNaN(value) ? 'n/a' : `${(value * 100).toFixed(1)}%`;
 }
@@ -170,8 +178,9 @@ export function handleSummary(data) {
   for (const name of Object.keys(COUNTERS)) {
     delta[name] = (metricValue(data, `srv_end_${name}`, 'value') || 0) - (metricValue(data, `srv_start_${name}`, 'value') || 0);
   }
-  const served = delta.hits + delta.prefetch_hits + delta.misses + delta.bypasses;
-  const upstreamTotal = delta.upstream_client + delta.upstream_prefetch;
+  const hits = delta.hits + delta.prefetch_hits + delta.stale;
+  const served = hits + delta.misses + delta.bypasses;
+  const upstreamTotal = delta.upstream_client + delta.upstream_prefetch + delta.upstream_revalidate;
   const window = seconds(DURATION);
   const latency = (tags, stat) => metricValue(data, `http_req_duration{${tags}}`, stat);
 
@@ -192,9 +201,13 @@ export function handleSummary(data) {
     },
     server: {
       ...delta,
-      hit_ratio: served > 0 ? (delta.hits + delta.prefetch_hits) / served : null,
+      hit_ratio: served > 0 ? hits / served : null,
+      stale_share: served > 0 ? delta.stale / served : null,
+      // The formula used before STALE was counted, for comparison with older results.
+      hit_ratio_without_stale: served - delta.stale > 0 ? (delta.hits + delta.prefetch_hits) / (served - delta.stale) : null,
       upstream_rps: window > 0 ? upstreamTotal / window : null,
       upstream_prefetch_rps: window > 0 ? delta.upstream_prefetch / window : null,
+      upstream_revalidate_rps: window > 0 ? delta.upstream_revalidate / window : null,
       useless_prefetch_share: delta.prefetch_executed > 0 ? 1 - delta.prefetch_hits / delta.prefetch_executed : null,
     },
     failed_rate: metricValue(data, 'http_req_failed{phase:measure}', 'rate'),
@@ -208,8 +221,8 @@ export function handleSummary(data) {
     `latency card     p50=${fmtMs(l.card.p50)} p95=${fmtMs(l.card.p95)} p99=${fmtMs(l.card.p99)}`,
     `latency authors  p50=${fmtMs(l.authors.p50)} p95=${fmtMs(l.authors.p95)} p99=${fmtMs(l.authors.p99)}`,
     `client hit ratio card=${fmtPct(result.client_hit_ratio.card)} authors=${fmtPct(result.client_hit_ratio.authors)}`,
-    `server hit ratio ${fmtPct(s.hit_ratio)}, upstream ${s.upstream_rps === null ? 'n/a' : s.upstream_rps.toFixed(1)} rps ` +
-      `(prefetch ${s.upstream_prefetch_rps === null ? 'n/a' : s.upstream_prefetch_rps.toFixed(1)} rps)`,
+    `server hit ratio ${fmtPct(s.hit_ratio)} (stale ${fmtPct(s.stale_share)}, without stale ${fmtPct(s.hit_ratio_without_stale)})`,
+    `upstream ${fmtRps(s.upstream_rps)} rps (prefetch ${fmtRps(s.upstream_prefetch_rps)}, revalidate ${fmtRps(s.upstream_revalidate_rps)})`,
     `prefetch executed=${s.prefetch_executed} hits=${s.prefetch_hits} useless=${fmtPct(s.useless_prefetch_share === null ? undefined : s.useless_prefetch_share)}`,
     `failed requests  ${fmtPct(result.failed_rate)}`,
     '',
