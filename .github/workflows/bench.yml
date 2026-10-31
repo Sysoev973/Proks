@@ -1,0 +1,113 @@
+name: bench
+
+# A/B-замер предзагрузки (k6/prefetch-chain.js) на Docker-стенде в CI.
+# Итог каждого запуска дописывается в history.json в ветке bench-data,
+# оттуда его берёт сайт Proks_site и рисует графики.
+#
+# Не на каждый push: прогон идёт около 10 минут, а раннеры GitHub шумные,
+# поэтому смысл имеет тренд по многим запускам, а не одно число.
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+  # Раз в неделю, понедельник 04:23 UTC: тренд не прерывается, даже если релизов нет.
+  schedule:
+    - cron: "23 4 * * 1"
+
+permissions:
+  contents: write # push в ветку bench-data
+
+# Два запуска одновременно не пишут в history.json: второй ждёт первый.
+concurrency:
+  group: bench
+  cancel-in-progress: false
+
+env:
+  # Как в README: upstream отдаёт max-age=300, без потолка записи не успевают
+  # истечь за прогон и предзагрузке нечего ускорять.
+  CACHE_MAX_TTL: 20s
+  # Короче, чем локальный замер (30s/2m), чтобы уложиться в разумное время CI.
+  WARMUP: 20s
+  DURATION: 1m
+  RUNS: "1"
+  HISTORY_LIMIT: "100"
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Стенд
+        run: docker compose up -d --build --wait postgres rabbitmq upstream proxy
+
+      - name: Книги для замера
+        run: docker compose exec -T postgres psql -U library_user -d library_db -v ON_ERROR_STOP=1 -q < migrations/bench_seed.sql
+
+      - uses: grafana/setup-k6-action@v1
+
+      - name: A/B-замер предзагрузки
+        run: bash bench/prefetch-ab.sh
+
+      - name: Запись для истории
+        run: |
+          jq -n \
+            --slurpfile off bench/results/prefetch-false-run1.json \
+            --slurpfile on bench/results/prefetch-true-run1.json \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg sha "$GITHUB_SHA" \
+            --arg ref "$GITHUB_REF_NAME" \
+            --arg event "$GITHUB_EVENT_NAME" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{date: $date, sha: $sha, ref: $ref, event: $event, run_url: $run_url,
+              prefetch_off: $off[0], prefetch_on: $on[0]}' > bench/results/record.json
+          cat bench/results/record.json
+
+      - name: Логи стенда
+        if: failure()
+        run: docker compose logs --no-color --tail 200
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: bench/results/
+
+      # Отдельная ветка без общей истории с main: результаты не засоряют историю кода,
+      # а main остаётся защищённой. Push от GITHUB_TOKEN не запускает ci.yml.
+      - name: Сохранить в ветку bench-data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin bench-data > /dev/null; then
+            git fetch --depth 1 origin bench-data
+            git worktree add data FETCH_HEAD
+          else
+            git worktree add --orphan -b bench-data data
+          fi
+          cd data
+          [ -f history.json ] || echo '[]' > history.json
+          jq --slurpfile r ../bench/results/record.json --argjson n "$HISTORY_LIMIT" \
+            '. + $r | if length > $n then .[length - $n:] else . end' history.json > history.tmp
+          mv history.tmp history.json
+          cp ../bench/results/record.json latest.json
+          git add history.json latest.json
+          git commit -q -m "bench: ${GITHUB_SHA::7} ($GITHUB_EVENT_NAME)"
+          git push origin HEAD:refs/heads/bench-data
+
+      # Тот же сигнал, что шлёт notify-site.yml: сайт пересоберётся со свежими цифрами.
+      # Без секрета замер всё равно сохранён, сайт подхватит его при следующей сборке.
+      - name: Сообщить сайту
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::SITE_DISPATCH_TOKEN не задан, сайт обновится по расписанию"
+            exit 0
+          fi
+          gh api repos/Sysoev973/Proks_site/dispatches \
+            -f event_type=proks-updated \
+            -f "client_payload[sha]=$SHA" \
+            -f "client_payload[event]=bench"
