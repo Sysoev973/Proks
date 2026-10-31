@@ -1,0 +1,37 @@
+name: Notify site
+
+# Сообщает сайту Proks_site, что изменилась документация или вышел релиз.
+# Сайт сам заберёт свежий README.md, docs/ и список релизов и пересоберётся.
+on:
+  push:
+    branches: [main]
+    paths:
+      - README.md
+      - docs/**
+  # Не по тегам: сайт показывает релизы, а фильтр paths к тегам не применяется.
+  release:
+    types: [published]
+
+# Встроенному GITHUB_TOKEN права не нужны: запрос в Proks_site идёт с отдельным токеном.
+permissions: {}
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Отправить repository_dispatch в Proks_site
+        env:
+          # Fine-grained токен только на Proks_site, Contents: read and write.
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+          SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Секрет SITE_DISPATCH_TOKEN не задан в Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+          gh api repos/Sysoev973/Proks_site/dispatches \
+            -f event_type=proks-updated \
+            -f "client_payload[sha]=$SHA" \
+            -f "client_payload[event]=$EVENT"
+          echo "Событие proks-updated отправлено ($EVENT, $SHA)"
