@@ -1,0 +1,45 @@
+name: Token check
+
+# Напоминает продлить SITE_DISPATCH_TOKEN: если до конца срока меньше недели
+# или токен уже не работает, запуск падает и GitHub присылает письмо.
+on:
+  # Понедельник 05:41 UTC; не ровный час, потому что в :00 очередь раннеров длиннее.
+  schedule:
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Проверить срок SITE_DISPATCH_TOKEN
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+          WARN_DAYS: 7
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Секрет SITE_DISPATCH_TOKEN не задан"
+            exit 1
+          fi
+          # GitHub возвращает срок fine-grained токена в заголовке ответа.
+          headers=$(curl -sS -o /dev/null -D - -w '%{http_code}\n' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/Sysoev973/Proks_site)
+          code=$(echo "$headers" | tail -n 1)
+          if [ "$code" != "200" ]; then
+            echo "::error::Токен не работает (HTTP $code): истёк или отозван. Создай новый и обнови секрет"
+            exit 1
+          fi
+          expires=$(echo "$headers" | grep -i '^github-authentication-token-expiration:' | cut -d' ' -f2- | tr -d '\r' || true)
+          if [ -z "$expires" ]; then
+            echo "Срок у токена не задан"
+            exit 0
+          fi
+          days=$(( ($(date -d "$expires" +%s) - $(date +%s)) / 86400 ))
+          echo "Токен истекает $expires, осталось $days дн."
+          if [ "$days" -lt "$WARN_DAYS" ]; then
+            echo "::error::SITE_DISPATCH_TOKEN истекает через $days дн. ($expires). Продли его и обнови секрет"
+            exit 1
+          fi
