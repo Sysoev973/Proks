@@ -8,7 +8,5 @@ coverage-*.html
 # Local event state from running the proxy outside Docker.
 data/
 
-# IDE data sources and local settings.
-.idea/dataSources.xml
-.idea/data_source_mapping.xml
-.idea/sqldialects.xml
+# Настройки IDE у каждого свои.
+.idea/
