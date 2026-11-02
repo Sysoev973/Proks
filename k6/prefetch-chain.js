@@ -81,6 +81,7 @@ export const options = {
   // error rate is a real pass/fail condition.
   thresholds: {
     'http_req_failed{phase:measure}': ['rate<0.01'],
+    'http_reqs{phase:measure}': ['count>=0'],
     'http_req_duration{phase:measure}': ['p(99)>=0'],
     'http_req_duration{phase:measure,step:card}': ['p(99)>=0'],
     'http_req_duration{phase:measure,step:authors}': ['p(99)>=0'],
@@ -211,6 +212,7 @@ export function handleSummary(data) {
       useless_prefetch_share: delta.prefetch_executed > 0 ? 1 - delta.prefetch_hits / delta.prefetch_executed : null,
     },
     failed_rate: metricValue(data, 'http_req_failed{phase:measure}', 'rate'),
+    requests: metricValue(data, 'http_reqs{phase:measure}', 'count'),
   };
 
   const l = result.latency_ms;
@@ -225,6 +227,7 @@ export function handleSummary(data) {
     `upstream ${fmtRps(s.upstream_rps)} rps (prefetch ${fmtRps(s.upstream_prefetch_rps)}, revalidate ${fmtRps(s.upstream_revalidate_rps)})`,
     `prefetch executed=${s.prefetch_executed} hits=${s.prefetch_hits} useless=${fmtPct(s.useless_prefetch_share === null ? undefined : s.useless_prefetch_share)}`,
     `failed requests  ${fmtPct(result.failed_rate)}`,
+    `requests         ${result.requests ?? 'n/a'}`,
     '',
   ].join('\n');
 

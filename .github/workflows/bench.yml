@@ -28,7 +28,7 @@ env:
   CACHE_MAX_TTL: 20s
   # Короче, чем локальный замер (30s/2m), чтобы уложиться в разумное время CI.
   WARMUP: 20s
-  DURATION: 1m
+  DURATION: 2m
   RUNS: "1"
   HISTORY_LIMIT: "100"
 
