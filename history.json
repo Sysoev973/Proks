@@ -305,5 +305,108 @@
       "failed_rate": 0,
       "requests": 9602
     }
+  },
+  {
+    "date": "2026-11-09T13:06:17Z",
+    "sha": "3427f646976ca06e6a600e8899881f1ee0b988c6",
+    "ref": "main",
+    "event": "schedule",
+    "run_url": "https://github.com/Sysoev973/Proks/actions/runs/42621600126",
+    "prefetch_off": {
+      "label": "prefetch-false-run1",
+      "proxies": 1,
+      "books": 2000,
+      "rate": 40,
+      "duration_s": 120,
+      "latency_ms": {
+        "all": {
+          "p50": 0.8730475,
+          "p95": 1.3304131999999997,
+          "p99": 1.6513919799999985
+        },
+        "card": {
+          "p50": 1.052226,
+          "p95": 1.396072,
+          "p99": 1.741411
+        },
+        "authors": {
+          "p50": 0.853894,
+          "p95": 1.185834,
+          "p99": 1.417312
+        }
+      },
+      "client_hit_ratio": {
+        "card": 0.49010622786919394,
+        "authors": 0.49010622786919394
+      },
+      "server": {
+        "hits": 3416,
+        "prefetch_hits": 0,
+        "stale": 1292,
+        "misses": 4900,
+        "bypasses": 0,
+        "upstream_client": 4900,
+        "upstream_prefetch": 0,
+        "upstream_revalidate": 1292,
+        "prefetch_executed": 0,
+        "hit_ratio": 0.4900083263946711,
+        "stale_share": 0.13447127393838468,
+        "hit_ratio_without_stale": 0.4107744107744108,
+        "upstream_rps": 51.6,
+        "upstream_prefetch_rps": 0,
+        "upstream_revalidate_rps": 10.766666666666667,
+        "useless_prefetch_share": null
+      },
+      "failed_rate": 0,
+      "requests": 9602
+    },
+    "prefetch_on": {
+      "label": "prefetch-true-run1",
+      "proxies": 1,
+      "books": 2000,
+      "rate": 40,
+      "duration_s": 120,
+      "latency_ms": {
+        "all": {
+          "p50": 0.5100155,
+          "p95": 1.3990790999999998,
+          "p99": 1.7268867299999988
+        },
+        "card": {
+          "p50": 1.086958,
+          "p95": 1.488195,
+          "p99": 1.9376
+        },
+        "authors": {
+          "p50": 0.40743,
+          "p95": 0.625263,
+          "p99": 1.071913
+        }
+      },
+      "client_hit_ratio": {
+        "card": 0.4919808373255572,
+        "authors": 0.9887523432618205
+      },
+      "server": {
+        "hits": 3380,
+        "prefetch_hits": 2405,
+        "stale": 1331,
+        "misses": 2494,
+        "bypasses": 0,
+        "upstream_client": 2493,
+        "upstream_prefetch": 2401,
+        "upstream_revalidate": 1330,
+        "prefetch_executed": 2430,
+        "hit_ratio": 0.7404786680541103,
+        "stale_share": 0.1385015608740895,
+        "hit_ratio_without_stale": 0.698755888392318,
+        "upstream_rps": 51.86666666666667,
+        "upstream_prefetch_rps": 20.008333333333333,
+        "upstream_revalidate_rps": 11.083333333333334,
+        "useless_prefetch_share": 0.010288065843621408
+      },
+      "failed_rate": 0,
+      "requests": 9602
+    }
   }
 ]
